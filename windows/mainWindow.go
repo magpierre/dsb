@@ -2,7 +2,6 @@ package windows
 
 import (
 	"context"
-	"io"
 	"time"
 
 	"dsb/windows/resources"
@@ -15,7 +14,6 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	th "fyne.io/x/fyne/theme"
 	delta_sharing "github.com/magpierre/go_delta_sharing_client"
 )
 
@@ -40,6 +38,7 @@ type MainWindow struct {
 	shareBindingList         binding.StringList
 	schemaBindingList        binding.StringList
 	tablesBindingList        binding.StringList
+	statusBar                *widget.Label
 }
 
 func CreateMainWindow() *MainWindow {
@@ -48,27 +47,34 @@ func CreateMainWindow() *MainWindow {
 	return &v
 }
 
-func (t *MainWindow) OpenProfile() *dialog.FileDialog {
-	d := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
-		if err != nil || uc == nil {
+func (t *MainWindow) OpenProfile() {
+	pd := NewProfileDialog(t.w, func(content string, err error) {
+		if err != nil {
+			t.SetStatus("Error opening profile")
+			dialog.ShowError(err, t.w)
 			return
 		}
 
-		d, err := io.ReadAll(uc)
-		if err != nil {
-			dialog.NewError(err, t.w)
+		if content == "" {
 			return
 		}
-		t.profile = string(d)
+
+		t.SetStatus("Loading profile...")
+		t.profile = content
 
 		ds, err := delta_sharing.NewSharingClientFromString(context.Background(), t.profile, "")
 		if err != nil {
-			dialog.NewError(err, t.w).Show()
+			t.SetStatus("Error connecting to Delta Sharing")
+			dialog.ShowError(err, t.w)
+			return
 		}
 
-		ds.ListShares()
-
-		share, _ := ds.ListShares()
+		share, err := ds.ListShares()
+		if err != nil {
+			t.SetStatus("Error listing shares")
+			dialog.ShowError(err, t.w)
+			return
+		}
 		t.share = make([]string, 0)
 		t.schemas = make([]string, 0)
 		t.tables = make([]string, 0)
@@ -82,18 +88,31 @@ func (t *MainWindow) OpenProfile() *dialog.FileDialog {
 		t.shareBindingList.Set(t.share)
 		t.schemaBindingList.Set(t.schemas)
 		t.tablesBindingList.Set(t.tables)
-	}, t.w)
-	return d
+		t.SetStatus("Profile loaded successfully")
+	})
+	pd.Show()
+}
+
+// SetStatus updates the status bar message
+func (t *MainWindow) SetStatus(message string) {
+	if t.statusBar != nil {
+		t.statusBar.SetText(message)
+	}
 }
 
 func (t *MainWindow) NewMainWindow() {
 	t.selected = Selected{}
 	t.a = app.NewWithID("dsb")
-	t.a.Settings().SetTheme(th.AdwaitaTheme())
+	t.a.Settings().SetTheme(&CustomTheme{})
 	t.top = widget.NewToolbar()
 	t.left = container.NewVBox()
 	t.right = container.NewVBox()
-	t.bottom = container.NewHBox()
+
+	// Create status bar
+	t.statusBar = widget.NewLabel("Ready")
+	t.statusBar.TextStyle = fyne.TextStyle{Italic: true}
+	t.bottom = container.NewHBox(t.statusBar)
+
 	t.shareBindingList = binding.NewStringList()
 	t.schemaBindingList = binding.NewStringList()
 	t.tablesBindingList = binding.NewStringList()
@@ -131,9 +150,11 @@ func (t *MainWindow) NewMainWindow() {
 	}
 
 	t.docTabs = tabs
+
 	shareWidget.OnSelected = func(id widget.ListItemID) {
 		x := t.share[id]
 		t.selected.share = x
+		t.SetStatus("Loading schemas for share: " + x)
 		t.ScanTree()
 		t.schemaBindingList.Set(t.schemas)
 		t.tables = make([]string, 0)
@@ -142,21 +163,25 @@ func (t *MainWindow) NewMainWindow() {
 		schemaWidget.UnselectAll()
 		tablesWidget.UnselectAll()
 		tabs.Refresh()
+		t.SetStatus("Share selected: " + x)
 	}
 	schemaWidget.OnSelected = func(id widget.ListItemID) {
 		x := t.schemas[id]
 		t.selected.schema = x
+		t.SetStatus("Loading tables for schema: " + x)
 		t.ScanTree()
 		t.schemaBindingList.Set(t.schemas)
 		t.tablesBindingList.Set(t.tables)
 		t.files = make([]string, 0)
 		tablesWidget.UnselectAll()
 		tabs.Refresh()
+		t.SetStatus("Schema selected: " + x)
 	}
 
 	tablesWidget.OnSelected = func(id widget.ListItemID) {
 		x := t.tables[id]
 		t.selected.table_name = x
+		t.SetStatus("Loading table data: " + x)
 		t.ScanTree()
 		t.schemaBindingList.Set(t.schemas)
 		t.tablesBindingList.Set(t.tables)
@@ -167,12 +192,12 @@ func (t *MainWindow) NewMainWindow() {
 			t.dataBrowser = &db
 		}
 		t.dataBrowser.GetData(t.profile, t.selected.table, fileSelected)
+		t.SetStatus("Table loaded: " + x)
 		/*da := NewDataAggregator()
 		ti := da.CreateTab(t.dataBrowser.parseRecord().header)
 		t.docTabs.Append(ti)
 		tabs.Refresh()
 		*/
-		t.docTabs.SelectIndex(1)
 	}
 
 	t.top.(*widget.Toolbar).Append(widget.NewToolbarAction(theme.MenuIcon(), func() {
@@ -185,8 +210,7 @@ func (t *MainWindow) NewMainWindow() {
 	t.top.(*widget.Toolbar).Append(widget.NewToolbarSeparator())
 	t.top.(*widget.Toolbar).Append(widget.NewToolbarAction(
 		theme.FileIcon(), func() {
-			d := t.OpenProfile()
-			d.Show()
+			t.OpenProfile()
 		}))
 
 	t.top.(*widget.Toolbar).Append(widget.NewToolbarSpacer())
@@ -198,7 +222,7 @@ func (t *MainWindow) NewMainWindow() {
 
 	c := container.NewBorder(t.top, t.bottom, t.left, t.right, widget.NewCard("", "", tabs))
 	t.w.SetContent(c)
-	t.OpenProfile().Show()
+	t.OpenProfile()
 	t.w.ShowAndRun()
 }
 

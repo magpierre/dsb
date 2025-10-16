@@ -9,6 +9,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -20,21 +21,53 @@ type Data struct {
 	header      []string
 	arrow_table arrow.Table
 	arrow_rec   arrow.Record
-	tab         container.TabItem
+	tab         *container.TabItem
+	tableName   string
 }
 
 type DataBrowser struct {
-	w       fyne.Window
-	content fyne.Container
-	Data    []Data
-	tabs    []*container.TabItem
-	docTabs *container.DocTabs
+	w            fyne.Window
+	Data         []Data
+	innerTabs    *container.DocTabs
+	docTabs      *container.DocTabs
+	browserTab   *container.TabItem
+	tabDataMap   map[*container.TabItem]*Data
 }
 
 func (t *DataBrowser) CreateWindow(docTabs *container.DocTabs) {
 	t.w = fyne.CurrentApp().Driver().AllWindows()[0]
 	t.docTabs = docTabs
 	t.Data = make([]Data, 0)
+	t.tabDataMap = make(map[*container.TabItem]*Data)
+
+	// Create persistent inner tabs for individual tables
+	t.innerTabs = container.NewDocTabs()
+	t.innerTabs.SetTabLocation(container.TabLocationBottom)
+
+	// Set up close intercept to clean up memory when tabs are closed
+	t.innerTabs.CloseIntercept = func(ti *container.TabItem) {
+		// Find and clean up the data associated with this tab
+		if data, exists := t.tabDataMap[ti]; exists {
+			// Release Arrow resources if they haven't been released yet
+			if data.arrow_rec != nil {
+				data.arrow_rec.Release()
+			}
+			if data.arrow_table != nil {
+				data.arrow_table.Release()
+			}
+			// Clear the data arrays to help GC
+			data.data = nil
+			data.header = nil
+			// Remove from map
+			delete(t.tabDataMap, ti)
+		}
+		// Remove the tab
+		t.innerTabs.Remove(ti)
+	}
+
+	// Create persistent Browser tab
+	t.browserTab = container.NewTabItem("Browser", t.innerTabs)
+	t.docTabs.Append(t.browserTab)
 }
 
 func (t *DataBrowser) CreateDataBrowser(dataItem *Data, delta_table delta_sharing.Table) {
@@ -53,28 +86,56 @@ func (t *DataBrowser) CreateDataBrowser(dataItem *Data, delta_table delta_sharin
 		template.(*widget.Label).Truncation = fyne.TextTruncateClip
 	}
 
-	content := widget.NewCard("", "", table)
-	t.tabs = append(t.tabs, container.NewTabItem(delta_table.Name, content))
+	// Calculate and set column widths based on header text
+	for i, headerText := range dataItem.header {
+		// Measure the header text width and add padding
+		textSize := fyne.MeasureText(headerText, theme.TextSize(), fyne.TextStyle{})
+		columnWidth := textSize.Width + theme.Padding()*4 // Add padding for better spacing
 
-	tabs := container.NewDocTabs(t.tabs...)
-	tabs.CloseIntercept = func(ti *container.TabItem) {
+		// Ensure a minimum width
+		if columnWidth < 80 {
+			columnWidth = 80
+		}
+
+		table.SetColumnWidth(i, columnWidth)
 	}
-	tabs.SetTabLocation(container.TabLocationBottom)
 
-	for _, v := range t.docTabs.Items {
-		if v.Text == "Browser" {
-			t.docTabs.Remove(v)
+	// Create table card with column and row count
+	rowCount := len(dataItem.data)
+	colCount := len(dataItem.header)
+	cardTitle := fmt.Sprintf("Table %s (%d columns x %d rows)", delta_table.Name, colCount, rowCount)
+	content := widget.NewCard("", cardTitle, table)
+
+	// Add new tab to the persistent inner tabs
+	newTab := container.NewTabItem(delta_table.Name, content)
+
+	// Store the tab reference in the data item and register in map
+	dataItem.tab = newTab
+	dataItem.tableName = delta_table.Name
+	t.tabDataMap[newTab] = dataItem
+
+	t.innerTabs.Append(newTab)
+
+	// Select the newly added tab
+	t.innerTabs.Select(newTab)
+
+	// Check if Browser tab still exists in docTabs, if not recreate it
+	browserExists := false
+	for _, item := range t.docTabs.Items {
+		if item == t.browserTab {
+			browserExists = true
+			break
 		}
 	}
 
-	browserAccordionItem := widget.NewAccordionItem("Browser", tabs)
-	browserAccordionItem.Open = true
-	accordion := widget.NewAccordion(browserAccordionItem)
-	t.docTabs.Append(container.NewTabItem("Browser", accordion))
+	if !browserExists {
+		// Recreate the Browser tab
+		t.browserTab = container.NewTabItem("Browser", t.innerTabs)
+		t.docTabs.Append(t.browserTab)
+	}
 
-	tabs.SelectIndex(len(t.tabs) - 1)
-	tabs.Refresh()
-	t.docTabs.SelectIndex(2)
+	// Select the Browser tab in the main tabs
+	t.docTabs.Select(t.browserTab)
 }
 
 func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id string) {
@@ -217,9 +278,9 @@ func (t *DataBrowser) parseRecord() *Data {
 		}
 		t.Data[dp].data = append(t.Data[dp].data, v)
 	}
-	t.Data[dp].arrow_rec.Release()
-
-	t.Data[dp].arrow_table.Release()
+	// Don't release Arrow resources here - they will be released when the tab is closed
+	// t.Data[dp].arrow_rec.Release()
+	// t.Data[dp].arrow_table.Release()
 	return &t.Data[dp]
 }
 
