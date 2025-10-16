@@ -2,6 +2,7 @@ package windows
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"dsb/windows/resources"
@@ -16,6 +17,45 @@ import (
 	"fyne.io/fyne/v2/widget"
 	delta_sharing "github.com/magpierre/go_delta_sharing_client"
 )
+
+// TappableListItem is a label that supports both regular click and right-click
+type TappableListItem struct {
+	widget.Label
+	onRightClick func(widget.ListItemID, *fyne.PointEvent)
+	onTap        func(widget.ListItemID)
+	itemID       widget.ListItemID
+}
+
+func newTappableListItem(onRightClick func(widget.ListItemID, *fyne.PointEvent)) *TappableListItem {
+	item := &TappableListItem{
+		onRightClick: onRightClick,
+		itemID:       -1,
+	}
+	item.ExtendBaseWidget(item)
+	return item
+}
+
+func (t *TappableListItem) SetItemID(id widget.ListItemID) {
+	t.itemID = id
+}
+
+func (t *TappableListItem) SetOnTap(callback func(widget.ListItemID)) {
+	t.onTap = callback
+}
+
+// Tapped handles regular left-click
+func (t *TappableListItem) Tapped(e *fyne.PointEvent) {
+	if t.onTap != nil && t.itemID >= 0 {
+		t.onTap(t.itemID)
+	}
+}
+
+// TappedSecondary handles right-click
+func (t *TappableListItem) TappedSecondary(e *fyne.PointEvent) {
+	if t.onRightClick != nil && t.itemID >= 0 {
+		t.onRightClick(t.itemID, e)
+	}
+}
 
 type Selected struct {
 	share      string
@@ -48,7 +88,7 @@ func CreateMainWindow() *MainWindow {
 }
 
 func (t *MainWindow) OpenProfile() {
-	pd := NewProfileDialog(t.w, func(content string, err error) {
+	pd := NewProfileDialog(t.w, t.a, func(content string, err error) {
 		if err != nil {
 			t.SetStatus("Error opening profile")
 			dialog.ShowError(err, t.w)
@@ -134,22 +174,33 @@ func (t *MainWindow) NewMainWindow() {
 		co.(*widget.Label).Bind(di.(binding.String))
 	})
 
+	// Store reference to the context menu callback
+	var showTableContextMenu func(widget.ListItemID, *fyne.PointEvent)
+
 	tablesWidget := widget.NewListWithData(t.tablesBindingList, func() fyne.CanvasObject {
-		return widget.NewLabel("template")
+		return newTappableListItem(showTableContextMenu)
 	}, func(di binding.DataItem, co fyne.CanvasObject) {
-		co.(*widget.Label).Bind(di.(binding.String))
+		item := co.(*TappableListItem)
+		item.Bind(di.(binding.String))
 	})
+
+	// Set item IDs and tap handler when updating
+	originalUpdateItem := tablesWidget.UpdateItem
+	tablesWidget.UpdateItem = func(id widget.ListItemID, item fyne.CanvasObject) {
+		if tappableItem, ok := item.(*TappableListItem); ok {
+			tappableItem.SetItemID(id)
+			// Connect regular tap to the list's OnSelected handler
+			tappableItem.SetOnTap(func(itemID widget.ListItemID) {
+				if tablesWidget.OnSelected != nil {
+					tablesWidget.OnSelected(itemID)
+				}
+			})
+		}
+		originalUpdateItem(id, item)
+	}
 
 	gr := container.NewVSplit(widget.NewCard("", "Shares", shareWidget), widget.NewCard("", "Schemas", schemaWidget))
 	t.left = container.NewGridWrap(fyne.NewSize(150, 768), gr)
-	tabs := container.NewDocTabs(container.NewTabItem("Tables", widget.NewCard("", "Tables", tablesWidget)))
-	tabs.CloseIntercept = func(ti *container.TabItem) {
-		if ti.Text == "Browser" {
-			tabs.Remove(ti)
-		}
-	}
-
-	t.docTabs = tabs
 
 	shareWidget.OnSelected = func(id widget.ListItemID) {
 		x := t.share[id]
@@ -162,7 +213,6 @@ func (t *MainWindow) NewMainWindow() {
 		t.tablesBindingList.Set(t.tables)
 		schemaWidget.UnselectAll()
 		tablesWidget.UnselectAll()
-		tabs.Refresh()
 		t.SetStatus("Share selected: " + x)
 	}
 	schemaWidget.OnSelected = func(id widget.ListItemID) {
@@ -174,7 +224,6 @@ func (t *MainWindow) NewMainWindow() {
 		t.tablesBindingList.Set(t.tables)
 		t.files = make([]string, 0)
 		tablesWidget.UnselectAll()
-		tabs.Refresh()
 		t.SetStatus("Schema selected: " + x)
 	}
 
@@ -191,14 +240,90 @@ func (t *MainWindow) NewMainWindow() {
 			db.CreateWindow(t.docTabs)
 			t.dataBrowser = &db
 		}
-		t.dataBrowser.GetData(t.profile, t.selected.table, fileSelected)
+		t.dataBrowser.GetData(t.profile, t.selected.table, fileSelected, nil)
 		t.SetStatus("Table loaded: " + x)
-		/*da := NewDataAggregator()
-		ti := da.CreateTab(t.dataBrowser.parseRecord().header)
-		t.docTabs.Append(ti)
-		tabs.Refresh()
-		*/
 	}
+
+	// Create context menu for tables list
+	// Define the context menu callback function
+	showTableContextMenu = func(itemID widget.ListItemID, e *fyne.PointEvent) {
+		// Get the table name
+		tableName := "unknown"
+		if itemID >= 0 && itemID < widget.ListItemID(len(t.tables)) {
+			tableName = t.tables[itemID]
+		}
+
+		t.SetStatus(fmt.Sprintf("Right-click on table: %s", tableName))
+
+		// Create the context menu
+		tableContextMenu := fyne.NewMenu("",
+			fyne.NewMenuItem("Load with Options...", func() {
+				if itemID < 0 || itemID >= widget.ListItemID(len(t.tables)) {
+					dialog.ShowInformation("Select a Table", "Please select a table first", t.w)
+					return
+				}
+
+				x := t.tables[itemID]
+				t.selected.table_name = x
+				t.ScanTree()
+
+				if len(t.files) == 0 {
+					dialog.ShowError(fmt.Errorf("no files available for table"), t.w)
+					return
+				}
+
+				fileSelected := t.files[0]
+
+				// Load the table schema first
+				t.SetStatus("Loading schema for table: " + x)
+				ds, err := delta_sharing.NewSharingClientFromString(context.Background(), t.profile, "")
+				if err != nil {
+					dialog.ShowError(err, t.w)
+					return
+				}
+
+				// Load Arrow table to get schema
+				arrow_table, err := delta_sharing.LoadArrowTable(ds, t.selected.table, fileSelected)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("failed to load table schema: %w", err), t.w)
+					return
+				}
+				defer arrow_table.Release()
+
+				schema := arrow_table.Schema()
+
+				// Show query options dialog with schema
+				queryDialog := NewQueryOptionsDialog(t.w, schema, func(options *QueryOptions) {
+					t.SetStatus("Loading table data with options: " + x)
+					if t.dataBrowser == nil {
+						var db DataBrowser
+						db.CreateWindow(t.docTabs)
+						t.dataBrowser = &db
+					}
+					t.dataBrowser.GetData(t.profile, t.selected.table, fileSelected, options)
+					t.SetStatus("Table loaded with options: " + x)
+				})
+				queryDialog.Show()
+			}),
+			fyne.NewMenuItem("Load All Data", func() {
+				if itemID >= 0 {
+					tablesWidget.OnSelected(itemID)
+				}
+			}),
+		)
+
+		// Show the context menu at the click position
+		widget.ShowPopUpMenuAtPosition(tableContextMenu, t.w.Canvas(), e.AbsolutePosition)
+	}
+
+	tabs := container.NewDocTabs(container.NewTabItem("Tables", widget.NewCard("", "Tables", tablesWidget)))
+	tabs.CloseIntercept = func(ti *container.TabItem) {
+		if ti.Text == "Browser" {
+			tabs.Remove(ti)
+		}
+	}
+
+	t.docTabs = tabs
 
 	t.top.(*widget.Toolbar).Append(widget.NewToolbarAction(theme.MenuIcon(), func() {
 		if !t.left.Visible() {

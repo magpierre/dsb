@@ -1,6 +1,7 @@
 package windows
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,15 +18,22 @@ type ProfileDialog struct {
 	window   fyne.Window
 	callback func(string, error)
 	fileList *widget.List
+	recentList *widget.List
 	files    []string
+	recentProfiles []string
 	homeDir  string
 	currentPath string
 	pathLabel *widget.Label
+	app      fyne.App
 }
 
-func NewProfileDialog(w fyne.Window, callback func(string, error)) *ProfileDialog {
+const maxRecentProfiles = 5
+const recentProfilesKey = "recent_profiles"
+
+func NewProfileDialog(w fyne.Window, a fyne.App, callback func(string, error)) *ProfileDialog {
 	pd := &ProfileDialog{
 		window:   w,
+		app:      a,
 		callback: callback,
 		files:    make([]string, 0),
 	}
@@ -38,7 +46,44 @@ func NewProfileDialog(w fyne.Window, callback func(string, error)) *ProfileDialo
 	pd.homeDir = homeDir
 	pd.currentPath = homeDir
 
+	// Load recent profiles
+	pd.loadRecentProfiles()
+
 	return pd
+}
+
+// loadRecentProfiles loads the list of recently selected profiles from preferences
+func (pd *ProfileDialog) loadRecentProfiles() {
+	recentJSON := pd.app.Preferences().StringWithFallback(recentProfilesKey, "[]")
+	pd.recentProfiles = make([]string, 0)
+	json.Unmarshal([]byte(recentJSON), &pd.recentProfiles)
+}
+
+// saveRecentProfiles saves the list of recently selected profiles to preferences
+func (pd *ProfileDialog) saveRecentProfiles() {
+	recentJSON, _ := json.Marshal(pd.recentProfiles)
+	pd.app.Preferences().SetString(recentProfilesKey, string(recentJSON))
+}
+
+// addRecentProfile adds a profile path to the recent profiles list
+func (pd *ProfileDialog) addRecentProfile(profilePath string) {
+	// Remove if already exists
+	for i, path := range pd.recentProfiles {
+		if path == profilePath {
+			pd.recentProfiles = append(pd.recentProfiles[:i], pd.recentProfiles[i+1:]...)
+			break
+		}
+	}
+
+	// Add to front
+	pd.recentProfiles = append([]string{profilePath}, pd.recentProfiles...)
+
+	// Keep only last 5
+	if len(pd.recentProfiles) > maxRecentProfiles {
+		pd.recentProfiles = pd.recentProfiles[:maxRecentProfiles]
+	}
+
+	pd.saveRecentProfiles()
 }
 
 func (pd *ProfileDialog) Show() {
@@ -46,6 +91,50 @@ func (pd *ProfileDialog) Show() {
 	pd.pathLabel = widget.NewLabel(pd.currentPath)
 	pd.pathLabel.Wrapping = fyne.TextTruncate
 	pd.pathLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	// Create recent profiles list
+	pd.recentList = widget.NewList(
+		func() int {
+			return len(pd.recentProfiles)
+		},
+		func() fyne.CanvasObject {
+			icon := widget.NewIcon(theme.HistoryIcon())
+			label := widget.NewLabel("template")
+			label.Truncation = fyne.TextTruncateEllipsis
+			return container.NewHBox(icon, label)
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			cont := obj.(*fyne.Container)
+			label := cont.Objects[1].(*widget.Label)
+			label.SetText(pd.recentProfiles[id])
+		},
+	)
+
+	// Handle recent profile selection
+	pd.recentList.OnSelected = func(id widget.ListItemID) {
+		profilePath := pd.recentProfiles[id]
+
+		// Check if file still exists
+		if _, err := os.Stat(profilePath); os.IsNotExist(err) {
+			dialog.ShowError(err, pd.window)
+			pd.recentList.UnselectAll()
+			return
+		}
+
+		// Read and return
+		content, err := os.ReadFile(profilePath)
+		if err != nil {
+			pd.callback("", err)
+			pd.dialog.Hide()
+			return
+		}
+
+		// Update recent profiles (move to front)
+		pd.addRecentProfile(profilePath)
+
+		pd.callback(string(content), nil)
+		pd.dialog.Hide()
+	}
 
 	// Create file list
 	pd.fileList = widget.NewList(
@@ -100,6 +189,10 @@ func (pd *ProfileDialog) Show() {
 				pd.dialog.Hide()
 				return
 			}
+
+			// Add to recent profiles
+			pd.addRecentProfile(fullPath)
+
 			pd.callback(string(content), nil)
 			pd.dialog.Hide()
 		}
@@ -139,6 +232,23 @@ func (pd *ProfileDialog) Show() {
 	instructions := widget.NewRichTextFromMarkdown("**Select a Delta Sharing profile file (.share, .json, or .txt)**\n\nDouble-click a folder to navigate, or click a file to select it.")
 	instructions.Wrapping = fyne.TextWrapWord
 
+	// Create recent profiles card (only show if there are recent profiles)
+	var recentCard *widget.Card
+	if len(pd.recentProfiles) > 0 {
+		recentCard = widget.NewCard("", "Recent Profiles", pd.recentList)
+	} else {
+		emptyLabel := widget.NewLabel("No recent profiles")
+		emptyLabel.TextStyle = fyne.TextStyle{Italic: true}
+		recentCard = widget.NewCard("", "Recent Profiles", emptyLabel)
+	}
+
+	// Create browser section
+	browserCard := widget.NewCard("", "Browse Files", pd.fileList)
+
+	// Split view with recent profiles on left and file browser on right
+	splitContent := container.NewHSplit(recentCard, browserCard)
+	splitContent.SetOffset(0.3) // 30% for recent profiles, 70% for file browser
+
 	// Main content with better spacing
 	content := container.NewBorder(
 		container.NewVBox(
@@ -149,7 +259,7 @@ func (pd *ProfileDialog) Show() {
 			filterInfo,
 		),
 		nil, nil, nil,
-		pd.fileList,
+		splitContent,
 	)
 
 	// Create the custom dialog
