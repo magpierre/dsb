@@ -15,20 +15,22 @@ import (
 	"fyne.io/fyne/v2/widget"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	delta_sharing "github.com/magpierre/go_delta_sharing_client"
 )
 
 type Data struct {
-	data           [][]string
-	header         []string
-	arrow_table    arrow.Table
-	arrow_rec      arrow.Record
-	tab            *container.TabItem
-	tableName      string
-	isFiltered     bool
-	filteredData   [][]string
-	filteredHeader []string
-	visibleColumns []int
+	data              [][]string
+	header            []string
+	arrow_table       arrow.Table
+	arrow_rec         arrow.Record
+	tab               *container.TabItem
+	tableName         string
+	isFiltered        bool
+	filteredData      [][]string
+	filteredHeader    []string
+	visibleColumns    []int
+	filteredRowIndices []int // Maps filtered row index to original row index
 }
 
 type DataBrowser struct {
@@ -83,6 +85,11 @@ func (t *DataBrowser) CreateDataBrowser(dataItem *Data, delta_table delta_sharin
 	dataItem.visibleColumns = make([]int, len(dataItem.header))
 	for i := range dataItem.visibleColumns {
 		dataItem.visibleColumns[i] = i
+	}
+	// Initialize row indices to match all rows
+	dataItem.filteredRowIndices = make([]int, len(dataItem.data))
+	for i := range dataItem.filteredRowIndices {
+		dataItem.filteredRowIndices[i] = i
 	}
 
 	// Create the table widget
@@ -204,18 +211,22 @@ func (t *DataBrowser) CreateDataBrowser(dataItem *Data, delta_table delta_sharin
 		if query == nil || len(query.Expressions) == 0 {
 			// No search filter - show all rows with visible columns
 			filteredData := make([][]string, len(dataItem.data))
+			filteredRowIndices := make([]int, len(dataItem.data))
 			for i, row := range dataItem.data {
 				newRow := make([]string, len(visibleCols))
 				for j, colIdx := range visibleCols {
 					newRow[j] = row[colIdx]
 				}
 				filteredData[i] = newRow
+				filteredRowIndices[i] = i
 			}
 			dataItem.filteredData = filteredData
+			dataItem.filteredRowIndices = filteredRowIndices
 		} else {
 			// Apply query filter
 			filteredData := make([][]string, 0)
-			for _, row := range dataItem.data {
+			filteredRowIndices := make([]int, 0)
+			for rowIdx, row := range dataItem.data {
 				// Evaluate query against full row
 				if queryParser.EvaluateRow(query, row, dataItem.header) {
 					// Create filtered row with only visible columns
@@ -224,9 +235,11 @@ func (t *DataBrowser) CreateDataBrowser(dataItem *Data, delta_table delta_sharin
 						newRow[j] = row[colIdx]
 					}
 					filteredData = append(filteredData, newRow)
+					filteredRowIndices = append(filteredRowIndices, rowIdx)
 				}
 			}
 			dataItem.filteredData = filteredData
+			dataItem.filteredRowIndices = filteredRowIndices
 		}
 
 		table.Refresh()
@@ -689,13 +702,24 @@ func (t *DataBrowser) exportData(dataItem *Data, format ExportFormat, tableName 
 		// Export in a goroutine
 		go func() {
 			var exportErr error
+
+			// Convert filtered data to Arrow table for export
+			filteredTable, convErr := t.createFilteredArrowTable(dataItem)
+			if convErr != nil {
+				pbi.Stop()
+				progressDialog.Hide()
+				dialog.ShowError(fmt.Errorf("failed to prepare filtered data: %w", convErr), t.w)
+				return
+			}
+			defer filteredTable.Release()
+
 			switch format {
 			case FormatParquet:
-				exportErr = ExportToParquet(dataItem.arrow_table, filePath)
+				exportErr = ExportToParquet(filteredTable, filePath)
 			case FormatCSV:
-				exportErr = ExportToCSV(dataItem.arrow_table, filePath)
+				exportErr = ExportToCSV(filteredTable, filePath)
 			case FormatJSON:
-				exportErr = ExportToJSON(dataItem.arrow_table, filePath)
+				exportErr = ExportToJSON(filteredTable, filePath)
 			}
 
 			// Hide progress dialog
@@ -720,4 +744,233 @@ func (t *DataBrowser) exportData(dataItem *Data, format ExportFormat, tableName 
 	saveDialog.SetFilter(storage.NewExtensionFileFilter([]string{ext}))
 
 	saveDialog.Show()
+}
+
+// createFilteredArrowTable creates an Arrow table from the filtered data
+func (t *DataBrowser) createFilteredArrowTable(dataItem *Data) (arrow.Table, error) {
+	if len(dataItem.filteredData) == 0 {
+		return nil, fmt.Errorf("no data to export")
+	}
+
+	// Get the original schema to determine column types
+	originalSchema := dataItem.arrow_table.Schema()
+
+	// Build new schema with only visible columns
+	newFields := make([]arrow.Field, len(dataItem.visibleColumns))
+	for i, colIdx := range dataItem.visibleColumns {
+		newFields[i] = originalSchema.Field(colIdx)
+	}
+	schema := arrow.NewSchema(newFields, nil)
+
+	// Create memory pool
+	pool := memory.NewGoAllocator()
+
+	// Get table reader to access typed values (shared across all columns)
+	tr := array.NewTableReader(dataItem.arrow_table, dataItem.arrow_table.NumRows())
+	defer tr.Release()
+	tr.Next()
+	rec := tr.Record()
+
+	// Build Arrow arrays for each column using the tracked row indices
+	columns := make([]arrow.Column, len(dataItem.visibleColumns))
+	for i, colIdx := range dataItem.visibleColumns {
+		field := originalSchema.Field(colIdx)
+
+		// Create builder based on data type
+		builder := array.NewBuilder(pool, field.Type)
+		defer builder.Release()
+
+		// Append values from the original Arrow column using tracked indices
+		// filteredRowIndices maps filtered row position to original row position
+		for _, originalRowIdx := range dataItem.filteredRowIndices {
+			col := rec.Column(colIdx)
+			appendValueToBuilder(builder, col, originalRowIdx)
+		}
+
+		// Build the array
+		arr := builder.NewArray()
+		defer arr.Release()
+
+		// Create chunked array
+		chunked := arrow.NewChunked(field.Type, []arrow.Array{arr})
+		columns[i] = *arrow.NewColumn(field, chunked)
+	}
+
+	// Create and return the table
+	return array.NewTable(schema, columns, int64(len(dataItem.filteredData))), nil
+}
+
+// formatValueFromArray formats a value from an Arrow array (helper for matching)
+func formatValueFromArray(col arrow.Array, pos int) string {
+	if col.IsNull(pos) {
+		return ""
+	}
+
+	switch col.DataType().ID() {
+	case arrow.STRUCT:
+		s := col.(*array.Struct)
+		b, _ := s.MarshalJSON()
+		return string(b)
+	case arrow.LIST:
+		as := array.NewSlice(col, int64(pos), int64(pos+1))
+		str := fmt.Sprintf("%v", as)
+		if len(str) > 253 {
+			return str[1:253] + "..."
+		}
+		return str
+	case arrow.STRING:
+		s := col.(*array.String)
+		return s.Value(pos)
+	case arrow.BINARY:
+		b := col.(*array.Binary)
+		return string(b.Value(pos))
+	case arrow.BOOL:
+		b := col.(*array.Boolean)
+		return fmt.Sprintf("%v", b.Value(pos))
+	case arrow.DATE32:
+		d32 := col.(*array.Date32)
+		return d32.Value(pos).ToTime().String()
+	case arrow.DATE64:
+		d64 := col.(*array.Date64)
+		return d64.Value(pos).ToTime().String()
+	case arrow.DECIMAL:
+		d128 := col.(*array.Decimal128)
+		return d128.Value(pos).BigInt().String()
+	case arrow.INT8:
+		i8 := col.(*array.Int8)
+		return fmt.Sprintf("%d", i8.Value(pos))
+	case arrow.INT16:
+		i16 := col.(*array.Int16)
+		return fmt.Sprintf("%d", i16.Value(pos))
+	case arrow.INT32:
+		i32 := col.(*array.Int32)
+		return fmt.Sprintf("%d", i32.Value(pos))
+	case arrow.INT64:
+		i64 := col.(*array.Int64)
+		return fmt.Sprintf("%d", i64.Value(pos))
+	case arrow.FLOAT16:
+		f16 := col.(*array.Float16)
+		return f16.Value(pos).String()
+	case arrow.FLOAT32:
+		f32 := col.(*array.Float32)
+		return fmt.Sprintf("%.2f", f32.Value(pos))
+	case arrow.FLOAT64:
+		f64 := col.(*array.Float64)
+		return fmt.Sprintf("%.2f", f64.Value(pos))
+	case arrow.TIMESTAMP:
+		ts := col.(*array.Timestamp)
+		return ts.Value(pos).ToTime(arrow.Nanosecond).String()
+	default:
+		return fmt.Sprintf("%v", col)
+	}
+}
+
+// appendValueToBuilder appends a typed value from an Arrow array to a builder
+func appendValueToBuilder(builder array.Builder, col arrow.Array, pos int) {
+	if col.IsNull(pos) {
+		builder.AppendNull()
+		return
+	}
+
+	switch col.DataType().ID() {
+	case arrow.STRING:
+		b := builder.(*array.StringBuilder)
+		s := col.(*array.String)
+		b.Append(s.Value(pos))
+	case arrow.BINARY:
+		b := builder.(*array.BinaryBuilder)
+		bin := col.(*array.Binary)
+		b.Append(bin.Value(pos))
+	case arrow.BOOL:
+		b := builder.(*array.BooleanBuilder)
+		bl := col.(*array.Boolean)
+		b.Append(bl.Value(pos))
+	case arrow.INT8:
+		b := builder.(*array.Int8Builder)
+		i8 := col.(*array.Int8)
+		b.Append(i8.Value(pos))
+	case arrow.INT16:
+		b := builder.(*array.Int16Builder)
+		i16 := col.(*array.Int16)
+		b.Append(i16.Value(pos))
+	case arrow.INT32:
+		b := builder.(*array.Int32Builder)
+		i32 := col.(*array.Int32)
+		b.Append(i32.Value(pos))
+	case arrow.INT64:
+		b := builder.(*array.Int64Builder)
+		i64 := col.(*array.Int64)
+		b.Append(i64.Value(pos))
+	case arrow.UINT8:
+		b := builder.(*array.Uint8Builder)
+		u8 := col.(*array.Uint8)
+		b.Append(u8.Value(pos))
+	case arrow.UINT16:
+		b := builder.(*array.Uint16Builder)
+		u16 := col.(*array.Uint16)
+		b.Append(u16.Value(pos))
+	case arrow.UINT32:
+		b := builder.(*array.Uint32Builder)
+		u32 := col.(*array.Uint32)
+		b.Append(u32.Value(pos))
+	case arrow.UINT64:
+		b := builder.(*array.Uint64Builder)
+		u64 := col.(*array.Uint64)
+		b.Append(u64.Value(pos))
+	case arrow.FLOAT16:
+		b := builder.(*array.Float16Builder)
+		f16 := col.(*array.Float16)
+		b.Append(f16.Value(pos))
+	case arrow.FLOAT32:
+		b := builder.(*array.Float32Builder)
+		f32 := col.(*array.Float32)
+		b.Append(f32.Value(pos))
+	case arrow.FLOAT64:
+		b := builder.(*array.Float64Builder)
+		f64 := col.(*array.Float64)
+		b.Append(f64.Value(pos))
+	case arrow.DATE32:
+		b := builder.(*array.Date32Builder)
+		d32 := col.(*array.Date32)
+		b.Append(d32.Value(pos))
+	case arrow.DATE64:
+		b := builder.(*array.Date64Builder)
+		d64 := col.(*array.Date64)
+		b.Append(d64.Value(pos))
+	case arrow.TIMESTAMP:
+		b := builder.(*array.TimestampBuilder)
+		ts := col.(*array.Timestamp)
+		b.Append(ts.Value(pos))
+	case arrow.DECIMAL128:
+		b := builder.(*array.Decimal128Builder)
+		d128 := col.(*array.Decimal128)
+		b.Append(d128.Value(pos))
+	case arrow.STRUCT:
+		// For struct types, we need to handle nested builders
+		b := builder.(*array.StructBuilder)
+		s := col.(*array.Struct)
+		b.Append(true) // Mark as valid
+		// Copy field values
+		for i := 0; i < s.NumField(); i++ {
+			fieldBuilder := b.FieldBuilder(i)
+			fieldCol := s.Field(i)
+			appendValueToBuilder(fieldBuilder, fieldCol, pos)
+		}
+	case arrow.LIST:
+		// For list types, handle nested values
+		b := builder.(*array.ListBuilder)
+		l := col.(*array.List)
+		b.Append(true)
+		valueBuilder := b.ValueBuilder()
+		offsets := l.Offsets()
+		start := int(offsets[pos])
+		end := int(offsets[pos+1])
+		values := l.ListValues()
+		for i := start; i < end; i++ {
+			appendValueToBuilder(valueBuilder, values, i)
+		}
+	default:
+		// For unsupported types, append null
+		builder.AppendNull()
+	}
 }

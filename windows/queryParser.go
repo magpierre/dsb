@@ -235,11 +235,15 @@ func (qp *QueryParser) evaluateExpression(expr Expression, row []string, headers
 	// If no column name, search all columns (contains)
 	if expr.ColumnName == "" && expr.Operator == OpContains {
 		searchTerm := strings.ToLower(expr.Value)
-		for _, cell := range row {
-			if strings.Contains(strings.ToLower(cell), searchTerm) {
+		fmt.Printf("Free search for '%s' in row with %d columns\n", searchTerm, len(row))
+		for i, cell := range row {
+			cellLower := strings.ToLower(cell)
+			if strings.Contains(cellLower, searchTerm) {
+				fmt.Printf("  Match found in column %d: '%s' contains '%s'\n", i, cell, searchTerm)
 				return true
 			}
 		}
+		fmt.Printf("  No match found\n")
 		return false
 	}
 

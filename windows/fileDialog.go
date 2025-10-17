@@ -2,6 +2,7 @@ package windows
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,13 +57,18 @@ func NewProfileDialog(w fyne.Window, a fyne.App, callback func(string, error)) *
 func (pd *ProfileDialog) loadRecentProfiles() {
 	recentJSON := pd.app.Preferences().StringWithFallback(recentProfilesKey, "[]")
 	pd.recentProfiles = make([]string, 0)
-	json.Unmarshal([]byte(recentJSON), &pd.recentProfiles)
+	err := json.Unmarshal([]byte(recentJSON), &pd.recentProfiles)
+	if err != nil {
+		fmt.Printf("Error loading recent profiles: %v\n", err)
+	}
+	fmt.Printf("Loaded %d recent profiles: %v\n", len(pd.recentProfiles), pd.recentProfiles)
 }
 
 // saveRecentProfiles saves the list of recently selected profiles to preferences
 func (pd *ProfileDialog) saveRecentProfiles() {
 	recentJSON, _ := json.Marshal(pd.recentProfiles)
 	pd.app.Preferences().SetString(recentProfilesKey, string(recentJSON))
+	fmt.Printf("Saved %d recent profiles: %v\n", len(pd.recentProfiles), pd.recentProfiles)
 }
 
 // addRecentProfile adds a profile path to the recent profiles list
@@ -232,15 +238,9 @@ func (pd *ProfileDialog) Show() {
 	instructions := widget.NewRichTextFromMarkdown("**Select a Delta Sharing profile file (.share, .json, or .txt)**\n\nDouble-click a folder to navigate, or click a file to select it.")
 	instructions.Wrapping = fyne.TextWrapWord
 
-	// Create recent profiles card (only show if there are recent profiles)
-	var recentCard *widget.Card
-	if len(pd.recentProfiles) > 0 {
-		recentCard = widget.NewCard("", "Recent Profiles", pd.recentList)
-	} else {
-		emptyLabel := widget.NewLabel("No recent profiles")
-		emptyLabel.TextStyle = fyne.TextStyle{Italic: true}
-		recentCard = widget.NewCard("", "Recent Profiles", emptyLabel)
-	}
+	// Create recent profiles card - always use the list
+	// The list will show nothing if empty, or show items if populated
+	recentCard := widget.NewCard("", "Recent Profiles", pd.recentList)
 
 	// Create browser section
 	browserCard := widget.NewCard("", "Browse Files", pd.fileList)
