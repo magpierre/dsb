@@ -2,7 +2,6 @@ package windows
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,17 +14,17 @@ import (
 )
 
 type ProfileDialog struct {
-	dialog   dialog.Dialog
-	window   fyne.Window
-	callback func(string, error)
-	fileList *widget.List
-	recentList *widget.List
-	files    []string
+	dialog         dialog.Dialog
+	window         fyne.Window
+	callback       func(string, error)
+	fileList       *widget.List
+	recentList     *widget.List
+	files          []string
 	recentProfiles []string
-	homeDir  string
-	currentPath string
-	pathLabel *widget.Label
-	app      fyne.App
+	homeDir        string
+	currentPath    string
+	pathLabel      *widget.Label
+	app            fyne.App
 }
 
 const maxRecentProfiles = 5
@@ -59,16 +58,15 @@ func (pd *ProfileDialog) loadRecentProfiles() {
 	pd.recentProfiles = make([]string, 0)
 	err := json.Unmarshal([]byte(recentJSON), &pd.recentProfiles)
 	if err != nil {
-		fmt.Printf("Error loading recent profiles: %v\n", err)
+		// Silently ignore error and start with empty recent profiles list
+		pd.recentProfiles = make([]string, 0)
 	}
-	fmt.Printf("Loaded %d recent profiles: %v\n", len(pd.recentProfiles), pd.recentProfiles)
 }
 
 // saveRecentProfiles saves the list of recently selected profiles to preferences
 func (pd *ProfileDialog) saveRecentProfiles() {
 	recentJSON, _ := json.Marshal(pd.recentProfiles)
 	pd.app.Preferences().SetString(recentProfilesKey, string(recentJSON))
-	fmt.Printf("Saved %d recent profiles: %v\n", len(pd.recentProfiles), pd.recentProfiles)
 }
 
 // addRecentProfile adds a profile path to the recent profiles list

@@ -3,6 +3,7 @@ package windows
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"dsb/windows/resources"
@@ -11,8 +12,8 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	delta_sharing "github.com/magpierre/go_delta_sharing_client"
@@ -57,6 +58,56 @@ func (t *TappableListItem) TappedSecondary(e *fyne.PointEvent) {
 	}
 }
 
+// TappableTreeNode is a container that supports right-click for tree nodes
+type TappableTreeNode struct {
+	widget.BaseWidget
+	content      *fyne.Container
+	nodeID       widget.TreeNodeID
+	onRightClick func(widget.TreeNodeID, *fyne.PointEvent)
+	treeWidget   *widget.Tree
+}
+
+func newTappableTreeNode(content *fyne.Container, nodeID widget.TreeNodeID, onRightClick func(widget.TreeNodeID, *fyne.PointEvent)) *TappableTreeNode {
+	t := &TappableTreeNode{
+		content:      content,
+		nodeID:       nodeID,
+		onRightClick: onRightClick,
+	}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *TappableTreeNode) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.content)
+}
+
+// Tapped handles regular left-click - pass through to tree widget
+func (t *TappableTreeNode) Tapped(e *fyne.PointEvent) {
+	// Trigger tree selection for this node
+	if t.treeWidget != nil && t.nodeID != "" {
+		t.treeWidget.Select(t.nodeID)
+	}
+}
+
+func (t *TappableTreeNode) TappedSecondary(e *fyne.PointEvent) {
+	if t.onRightClick != nil {
+		t.onRightClick(t.nodeID, e)
+	}
+}
+
+func (t *TappableTreeNode) UpdateContent(content *fyne.Container) {
+	t.content = content
+	t.Refresh()
+}
+
+func (t *TappableTreeNode) UpdateNodeID(nodeID widget.TreeNodeID) {
+	t.nodeID = nodeID
+}
+
+func (t *TappableTreeNode) SetTreeWidget(tree *widget.Tree) {
+	t.treeWidget = tree
+}
+
 type Selected struct {
 	share      string
 	schema     string
@@ -68,17 +119,16 @@ type MainWindow struct {
 	w                        fyne.Window
 	top, left, right, bottom fyne.CanvasObject
 	profile                  string
-	share                    []string
-	schemas                  []string
-	tables                   []string
 	files                    []string
 	selected                 Selected
 	docTabs                  *container.DocTabs
 	dataBrowser              *DataBrowser
-	shareBindingList         binding.StringList
-	schemaBindingList        binding.StringList
-	tablesBindingList        binding.StringList
 	statusBar                *widget.Label
+	exportButton             *widget.Button
+	toolbar                  *widget.Toolbar
+	themeManager             *ThemeManager
+	navTree                  *NavigationTree
+	treeWidget               *widget.Tree
 }
 
 func CreateMainWindow() *MainWindow {
@@ -102,32 +152,23 @@ func (t *MainWindow) OpenProfile() {
 		t.SetStatus("Loading profile...")
 		t.profile = content
 
-		ds, err := delta_sharing.NewSharingClientFromString(context.Background(), t.profile, "")
+		// Initialize navigation tree with shares
+		err = t.navTree.LoadShares(t.profile)
 		if err != nil {
-			t.SetStatus("Error connecting to Delta Sharing")
+			t.SetStatus("Error loading shares")
 			dialog.ShowError(err, t.w)
 			return
 		}
 
-		share, err := ds.ListShares()
-		if err != nil {
-			t.SetStatus("Error listing shares")
-			dialog.ShowError(err, t.w)
-			return
-		}
-		t.share = make([]string, 0)
-		t.schemas = make([]string, 0)
-		t.tables = make([]string, 0)
 		t.files = make([]string, 0)
 		t.selected = Selected{}
-		t.w.Content().Refresh()
-		for _, s := range share {
-			t.share = append(t.share, s.Name)
+
+		// Refresh tree widget to show shares
+		if t.treeWidget != nil {
+			t.treeWidget.Refresh()
 		}
 
-		t.shareBindingList.Set(t.share)
-		t.schemaBindingList.Set(t.schemas)
-		t.tablesBindingList.Set(t.tables)
+		t.w.Content().Refresh()
 		t.SetStatus("Profile loaded successfully")
 	})
 	pd.Show()
@@ -143,8 +184,13 @@ func (t *MainWindow) SetStatus(message string) {
 func (t *MainWindow) NewMainWindow() {
 	t.selected = Selected{}
 	t.a = app.NewWithID("dsb")
-	t.a.Settings().SetTheme(&CustomTheme{})
-	t.top = widget.NewToolbar()
+
+	// Initialize theme manager and set theme
+	t.themeManager = NewThemeManager(t.a)
+	t.a.Settings().SetTheme(t.themeManager.GetCurrentTheme())
+
+	t.toolbar = widget.NewToolbar()
+	t.top = t.toolbar
 	t.left = container.NewVBox()
 	t.right = container.NewVBox()
 
@@ -153,264 +199,476 @@ func (t *MainWindow) NewMainWindow() {
 	t.statusBar.TextStyle = fyne.TextStyle{Italic: true}
 	t.bottom = container.NewHBox(t.statusBar)
 
-	t.shareBindingList = binding.NewStringList()
-	t.schemaBindingList = binding.NewStringList()
-	t.tablesBindingList = binding.NewStringList()
+	// Initialize navigation tree
+	t.navTree = NewNavigationTree(t)
+
 	t.w = t.a.NewWindow("Delta Sharing Browser")
 	t.w.Resize(fyne.NewSize(700, 600))
+
+	// Set up drag and drop handler
+	t.w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
+		if len(uris) > 0 {
+			uri := uris[0]
+			// You can now use the uri to access the dropped file
+			fileContent, err := storage.Reader(uri)
+			if err != nil {
+				t.SetStatus("Error reading file")
+				return
+			}
+			defer fileContent.Close()
+
+			// Read the content and convert to string
+			content, err := io.ReadAll(fileContent)
+			if err != nil {
+				t.SetStatus("Error reading file content")
+				return
+			}
+			t.profile = string(content)
+			t.SetStatus("Loading profile...")
+
+			// Initialize navigation tree with shares
+			err = t.navTree.LoadShares(t.profile)
+			if err != nil {
+				t.SetStatus("Error loading shares")
+				dialog.ShowError(err, t.w)
+				return
+			}
+
+			t.files = make([]string, 0)
+			t.selected = Selected{}
+
+			// Refresh tree widget to show shares
+			if t.treeWidget != nil {
+				t.treeWidget.Refresh()
+			}
+
+			t.w.Content().Refresh()
+			t.SetStatus("Profile loaded successfully")
+		}
+	})
 
 	logo := canvas.NewImageFromResource(resources.ResourceDeltasharingPng)
 	logo.FillMode = canvas.ImageFillContain
 
-	shareWidget := widget.NewListWithData(t.shareBindingList, func() fyne.CanvasObject {
-		return widget.NewLabel("template")
-	}, func(di binding.DataItem, co fyne.CanvasObject) {
-		co.(*widget.Label).Bind(di.(binding.String))
-	})
+	// Create tree widget for navigation
+	t.treeWidget = widget.NewTree(
+		// ChildUIDs: Return child node IDs for a given parent
+		func(uid widget.TreeNodeID) []widget.TreeNodeID {
+			return t.navTree.GetChildren(uid)
+		},
 
-	schemaWidget := widget.NewListWithData(t.schemaBindingList, func() fyne.CanvasObject {
-		return widget.NewLabel("template")
-	}, func(di binding.DataItem, co fyne.CanvasObject) {
-		co.(*widget.Label).Bind(di.(binding.String))
-	})
+		// IsBranch: Return true if node has/can have children
+		func(uid widget.TreeNodeID) bool {
+			return t.navTree.IsBranch(uid)
+		},
 
-	// Store reference to the context menu callback
-	var showTableContextMenu func(widget.ListItemID, *fyne.PointEvent)
+		// CreateNode: Template for tree nodes
+		func(branch bool) fyne.CanvasObject {
+			icon := widget.NewIcon(theme.FolderIcon())
+			label := widget.NewLabel("Template")
+			label.Truncation = fyne.TextTruncateOff // Disable truncation to allow horizontal scrolling
+			// Set a minimum width to enable horizontal scrolling for long names
+			label.Resize(fyne.NewSize(500, label.MinSize().Height))
+			content := container.NewHBox(icon, label)
 
-	tablesWidget := widget.NewListWithData(t.tablesBindingList, func() fyne.CanvasObject {
-		return newTappableListItem(showTableContextMenu)
-	}, func(di binding.DataItem, co fyne.CanvasObject) {
-		item := co.(*TappableListItem)
-		item.Bind(di.(binding.String))
-	})
+			// Wrap in TappableTreeNode to support right-click
+			tappable := newTappableTreeNode(content, "", t.handleTreeRightClick)
+			return tappable
+		},
 
-	// Set item IDs and tap handler when updating
-	originalUpdateItem := tablesWidget.UpdateItem
-	tablesWidget.UpdateItem = func(id widget.ListItemID, item fyne.CanvasObject) {
-		if tappableItem, ok := item.(*TappableListItem); ok {
-			tappableItem.SetItemID(id)
-			// Connect regular tap to the list's OnSelected handler
-			tappableItem.SetOnTap(func(itemID widget.ListItemID) {
-				if tablesWidget.OnSelected != nil {
-					tablesWidget.OnSelected(itemID)
+		// UpdateNode: Apply data to template
+		func(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
+			// Update the tappable node's ID
+			if tappable, ok := obj.(*TappableTreeNode); ok {
+				tappable.UpdateNodeID(uid)
+				tappable.SetTreeWidget(t.treeWidget)
+				// Update the display content
+				if tappable.content != nil {
+					t.navTree.UpdateNodeDisplay(uid, tappable.content, branch)
 				}
-			})
-		}
-		originalUpdateItem(id, item)
+			}
+		},
+	)
+
+	// Set the tree widget reference for all tappable nodes - this is a bit hacky but necessary
+	// We need to do a second pass after creating the tree
+	// This will be set in UpdateNode as nodes are rendered
+
+	// Handle tree node selection
+	t.treeWidget.OnSelected = func(uid widget.TreeNodeID) {
+		t.handleTreeSelection(uid)
 	}
 
-	gr := container.NewVSplit(widget.NewCard("", "Shares", shareWidget), widget.NewCard("", "Schemas", schemaWidget))
-	t.left = container.NewGridWrap(fyne.NewSize(150, 768), gr)
-
-	shareWidget.OnSelected = func(id widget.ListItemID) {
-		x := t.share[id]
-		t.selected.share = x
-		t.SetStatus("Loading schemas for share: " + x)
-		t.ScanTree()
-		t.schemaBindingList.Set(t.schemas)
-		t.tables = make([]string, 0)
-		t.files = make([]string, 0)
-		t.tablesBindingList.Set(t.tables)
-		schemaWidget.UnselectAll()
-		tablesWidget.UnselectAll()
-		t.SetStatus("Share selected: " + x)
-	}
-	schemaWidget.OnSelected = func(id widget.ListItemID) {
-		x := t.schemas[id]
-		t.selected.schema = x
-		t.SetStatus("Loading tables for schema: " + x)
-		t.ScanTree()
-		t.schemaBindingList.Set(t.schemas)
-		t.tablesBindingList.Set(t.tables)
-		t.files = make([]string, 0)
-		tablesWidget.UnselectAll()
-		t.SetStatus("Schema selected: " + x)
-	}
-
-	tablesWidget.OnSelected = func(id widget.ListItemID) {
-		x := t.tables[id]
-		t.selected.table_name = x
-		t.SetStatus("Loading table data: " + x)
-		t.ScanTree()
-		t.schemaBindingList.Set(t.schemas)
-		t.tablesBindingList.Set(t.tables)
-		fileSelected := t.files[0]
-		if t.dataBrowser == nil {
-			var db DataBrowser
-			db.CreateWindow(t.docTabs)
-			t.dataBrowser = &db
-		}
-		t.dataBrowser.GetData(t.profile, t.selected.table, fileSelected, nil)
-		t.SetStatus("Table loaded: " + x)
-	}
-
-	// Create context menu for tables list
-	// Define the context menu callback function
-	showTableContextMenu = func(itemID widget.ListItemID, e *fyne.PointEvent) {
-		// Get the table name
-		tableName := "unknown"
-		if itemID >= 0 && itemID < widget.ListItemID(len(t.tables)) {
-			tableName = t.tables[itemID]
-		}
-
-		t.SetStatus(fmt.Sprintf("Right-click on table: %s", tableName))
-
-		// Create the context menu
-		tableContextMenu := fyne.NewMenu("",
-			fyne.NewMenuItem("Load with Options...", func() {
-				if itemID < 0 || itemID >= widget.ListItemID(len(t.tables)) {
-					dialog.ShowInformation("Select a Table", "Please select a table first", t.w)
-					return
-				}
-
-				x := t.tables[itemID]
-				t.selected.table_name = x
-				t.ScanTree()
-
-				if len(t.files) == 0 {
-					dialog.ShowError(fmt.Errorf("no files available for table"), t.w)
-					return
-				}
-
-				fileSelected := t.files[0]
-
-				// Load the table schema first
-				t.SetStatus("Loading schema for table: " + x)
-				ds, err := delta_sharing.NewSharingClientFromString(context.Background(), t.profile, "")
+	// Handle branch expansion - lazy load children
+	t.treeWidget.OnBranchOpened = func(uid widget.TreeNodeID) {
+		node := t.navTree.GetNode(uid)
+		if node != nil && !node.ChildrenLoaded {
+			// Lazy load children in background
+			go func() {
+				t.SetStatus("Loading...")
+				err := t.navTree.LazyLoadChildren(uid)
 				if err != nil {
+					t.SetStatus(fmt.Sprintf("Error loading: %v", err))
 					dialog.ShowError(err, t.w)
 					return
 				}
-
-				// Load Arrow table to get schema
-				arrow_table, err := delta_sharing.LoadArrowTable(ds, t.selected.table, fileSelected)
-				if err != nil {
-					dialog.ShowError(fmt.Errorf("failed to load table schema: %w", err), t.w)
-					return
-				}
-				defer arrow_table.Release()
-
-				schema := arrow_table.Schema()
-
-				// Show query options dialog with schema
-				queryDialog := NewQueryOptionsDialog(t.w, schema, func(options *QueryOptions) {
-					t.SetStatus("Loading table data with options: " + x)
-					if t.dataBrowser == nil {
-						var db DataBrowser
-						db.CreateWindow(t.docTabs)
-						t.dataBrowser = &db
-					}
-					t.dataBrowser.GetData(t.profile, t.selected.table, fileSelected, options)
-					t.SetStatus("Table loaded with options: " + x)
-				})
-				queryDialog.Show()
-			}),
-			fyne.NewMenuItem("Load All Data", func() {
-				if itemID >= 0 {
-					tablesWidget.OnSelected(itemID)
-				}
-			}),
-		)
-
-		// Show the context menu at the click position
-		widget.ShowPopUpMenuAtPosition(tableContextMenu, t.w.Canvas(), e.AbsolutePosition)
+				// Refresh tree to show new children
+				t.treeWidget.Refresh()
+				t.SetStatus("Ready")
+			}()
+		}
 	}
 
-	tabs := container.NewDocTabs(container.NewTabItem("Tables", widget.NewCard("", "Tables", tablesWidget)))
+	// Set up navigation panel with tree - use scroll container
+	treeScroll := container.NewScroll(t.treeWidget)
+	navCard := widget.NewCard("", "Navigation", treeScroll)
+	// Make navigation panel wider to accommodate longer names (350px instead of 250px)
+	t.left = container.NewGridWrap(fyne.NewSize(350, 768), navCard)
+
+	tabs := container.NewDocTabs()
 	tabs.CloseIntercept = func(ti *container.TabItem) {
+		// Prevent closing the Browser tab - it should always be available
 		if ti.Text == "Browser" {
-			tabs.Remove(ti)
+			// Don't remove the Browser tab, just ignore the close request
+			return
 		}
+		// Allow other tabs to be closed
+		tabs.Remove(ti)
 	}
 
 	t.docTabs = tabs
 
-	t.top.(*widget.Toolbar).Append(widget.NewToolbarAction(theme.MenuIcon(), func() {
+	t.toolbar.Append(widget.NewToolbarAction(theme.MenuIcon(), func() {
 		if !t.left.Visible() {
 			t.left.Show()
 		} else {
 			t.left.Hide()
 		}
 	}))
-	t.top.(*widget.Toolbar).Append(widget.NewToolbarSeparator())
-	t.top.(*widget.Toolbar).Append(widget.NewToolbarAction(
+	t.toolbar.Append(widget.NewToolbarSeparator())
+	t.toolbar.Append(widget.NewToolbarAction(
 		theme.FileIcon(), func() {
 			t.OpenProfile()
 		}))
+	t.toolbar.Append(widget.NewToolbarSeparator())
+	t.toolbar.Append(widget.NewToolbarAction(
+		theme.ColorPaletteIcon(), func() {
+			t.showThemeSelector()
+		}))
 
-	t.top.(*widget.Toolbar).Append(widget.NewToolbarSpacer())
+	t.toolbar.Append(widget.NewToolbarSpacer())
+
+	// Create export button (initially hidden)
+	t.exportButton = widget.NewButtonWithIcon("Export", theme.DocumentSaveIcon(), func() {
+		t.showExportMenu()
+	})
+	t.exportButton.Hide()
 
 	llo := container.NewWithoutLayout(logo)
 	logo.Resize(fyne.NewSize(200, 50))
 	logo.Move(fyne.NewPos(160, -10))
-	t.top = container.NewStack(t.top, llo)
+
+	// Create a container for the export button positioned on the right
+	exportContainer := container.NewWithoutLayout(t.exportButton)
+	t.exportButton.Resize(fyne.NewSize(100, 36))
+
+	t.top = container.NewStack(t.toolbar, llo, exportContainer)
+
+	// Set up tab change callback to show/hide export button
+	tabs.OnSelected = func(ti *container.TabItem) {
+		t.updateExportButton()
+	}
 
 	c := container.NewBorder(t.top, t.bottom, t.left, t.right, widget.NewCard("", "", tabs))
 	t.w.SetContent(c)
+
+	// Add a resize callback to position the export button correctly when window resizes
+	t.w.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
+		// This is a workaround to trigger position updates
+	})
+
+	// Monitor canvas size changes to reposition export button
+	go func() {
+		var lastSize fyne.Size
+		for {
+			time.Sleep(100 * time.Millisecond)
+			currentSize := t.w.Canvas().Size()
+			if currentSize.Width != lastSize.Width || currentSize.Height != lastSize.Height {
+				lastSize = currentSize
+				t.updateExportButton()
+			}
+		}
+	}()
+
+	t.w.SetOnClosed(func() {
+		// Cleanup if needed
+	})
+
 	t.OpenProfile()
 	t.w.ShowAndRun()
 }
 
+// updateExportButton shows or hides the export button based on the current tab
+func (t *MainWindow) updateExportButton() {
+	if t.docTabs.Selected() != nil && t.docTabs.Selected().Text == "Browser" {
+		t.exportButton.Show()
+		// Position the button on the right side of the content area
+		windowSize := t.w.Canvas().Size()
+		// Position button: aligned to the right edge of the window
+		buttonX := windowSize.Width - 130
+		t.exportButton.Move(fyne.NewPos(buttonX, 4))
+	} else {
+		t.exportButton.Hide()
+	}
+	t.exportButton.Refresh()
+}
+
+// showThemeSelector displays a dialog for selecting the application theme
+func (t *MainWindow) showThemeSelector() {
+	currentTheme := t.themeManager.GetCurrentType()
+
+	// Create radio group with theme options
+	themeOptions := []string{
+		GetThemeName(ThemeTypeCustom),
+		GetThemeName(ThemeTypeShadcnSlate),
+		GetThemeName(ThemeTypeShadcnStone),
+		GetThemeName(ThemeTypeDefault),
+	}
+
+	selectedIndex := 0
+	switch currentTheme {
+	case ThemeTypeCustom:
+		selectedIndex = 0
+	case ThemeTypeShadcnSlate:
+		selectedIndex = 1
+	case ThemeTypeShadcnStone:
+		selectedIndex = 2
+	case ThemeTypeDefault:
+		selectedIndex = 3
+	}
+
+	radio := widget.NewRadioGroup(themeOptions, nil)
+	radio.SetSelected(themeOptions[selectedIndex])
+
+	// Create info text
+	infoLabel := widget.NewLabel("Choose a theme for the application.\nChanges will be applied immediately and saved.")
+	infoLabel.Wrapping = fyne.TextWrapWord
+
+	// Create the dialog content
+	content := container.NewVBox(
+		infoLabel,
+		widget.NewSeparator(),
+		radio,
+	)
+
+	// Create custom dialog
+	d := dialog.NewCustom("Select Theme", "Close", content, t.w)
+	d.Resize(fyne.NewSize(400, 300))
+
+	// Handle theme selection changes
+	radio.OnChanged = func(selected string) {
+		var newTheme ThemeType
+		switch selected {
+		case GetThemeName(ThemeTypeCustom):
+			newTheme = ThemeTypeCustom
+		case GetThemeName(ThemeTypeShadcnSlate):
+			newTheme = ThemeTypeShadcnSlate
+		case GetThemeName(ThemeTypeShadcnStone):
+			newTheme = ThemeTypeShadcnStone
+		case GetThemeName(ThemeTypeDefault):
+			newTheme = ThemeTypeDefault
+		}
+
+		if newTheme != t.themeManager.GetCurrentType() {
+			t.themeManager.SetTheme(newTheme)
+			t.SetStatus(fmt.Sprintf("Theme changed to: %s", selected))
+		}
+	}
+
+	d.Show()
+}
+
+// showExportMenu displays the export menu for the currently selected browser tab
+func (t *MainWindow) showExportMenu() {
+	if t.dataBrowser == nil || t.dataBrowser.innerTabs == nil {
+		return
+	}
+
+	selectedTab := t.dataBrowser.innerTabs.Selected()
+	if selectedTab == nil {
+		dialog.ShowInformation("No Table Selected", "Please select a table tab to export", t.w)
+		return
+	}
+
+	// Get the data item for the selected tab
+	dataItem, exists := t.dataBrowser.tabDataMap[selectedTab]
+	if !exists {
+		dialog.ShowError(fmt.Errorf("could not find data for selected tab"), t.w)
+		return
+	}
+
+	// Get table name from the data item
+	tableName := dataItem.tableName
+
+	// Create export menu
+	exportMenu := fyne.NewMenu("Export",
+		fyne.NewMenuItem("Export as Parquet", func() {
+			t.dataBrowser.exportData(dataItem, FormatParquet, tableName)
+		}),
+		fyne.NewMenuItem("Export as CSV", func() {
+			t.dataBrowser.exportData(dataItem, FormatCSV, tableName)
+		}),
+		fyne.NewMenuItem("Export as JSON", func() {
+			t.dataBrowser.exportData(dataItem, FormatJSON, tableName)
+		}),
+	)
+
+	// Show the menu at the export button position
+	widget.ShowPopUpMenuAtPosition(exportMenu, t.w.Canvas(), fyne.CurrentApp().Driver().AbsolutePositionForObject(t.exportButton))
+}
+
+// handleTreeSelection handles selection of a node in the navigation tree
+func (t *MainWindow) handleTreeSelection(nodeID widget.TreeNodeID) {
+	node := t.navTree.GetNode(nodeID)
+	if node == nil {
+		return
+	}
+
+	switch node.NodeType {
+	case NodeTypeShare:
+		t.selected.share = node.Name
+		t.selected.schema = ""
+		t.selected.table_name = ""
+		t.SetStatus("Share selected: " + node.Name)
+
+	case NodeTypeSchema:
+		t.selected.share = node.Share
+		t.selected.schema = node.Name
+		t.selected.table_name = ""
+		t.SetStatus("Schema selected: " + node.Name)
+
+	case NodeTypeTable:
+		t.selected.share = node.Share
+		t.selected.schema = node.Schema
+		t.selected.table_name = node.Name
+		t.selected.table = node.Table
+		t.SetStatus("Loading table data: " + node.Name)
+
+		// Load table data
+		t.loadTableData(node.Table, nil)
+	}
+}
+
+// handleTreeRightClick handles right-click on tree nodes
+func (t *MainWindow) handleTreeRightClick(nodeID widget.TreeNodeID, e *fyne.PointEvent) {
+	node := t.navTree.GetNode(nodeID)
+	if node == nil {
+		return
+	}
+
+	// Create context menu based on node type
+	var menuItems []*fyne.MenuItem
+
+	switch node.NodeType {
+	case NodeTypeTable:
+		// Menu items for table nodes
+		menuItems = []*fyne.MenuItem{
+			fyne.NewMenuItem("Open Table", func() {
+				// Select and load the table with default options (no filtering)
+				t.treeWidget.Select(nodeID)
+			}),
+			fyne.NewMenuItem("Open with Query Options...", func() {
+				// Show query options dialog
+				SimpleQueryOptionsDialog(t.w, func(options *QueryOptions) {
+					// Update selected state
+					t.selected.share = node.Share
+					t.selected.schema = node.Schema
+					t.selected.table_name = node.Name
+					t.selected.table = node.Table
+					t.SetStatus("Loading table data with options: " + node.Name)
+
+					// Load table data with options
+					t.loadTableData(node.Table, options)
+				})
+			}),
+			fyne.NewMenuItem("Copy Table Name", func() {
+				t.w.Clipboard().SetContent(node.Name)
+				t.SetStatus("Table name copied to clipboard")
+			}),
+		}
+
+	case NodeTypeSchema:
+		// Menu items for schema nodes
+		menuItems = []*fyne.MenuItem{
+			fyne.NewMenuItem("Expand Schema", func() {
+				t.treeWidget.OpenBranch(nodeID)
+			}),
+			fyne.NewMenuItem("Copy Schema Name", func() {
+				t.w.Clipboard().SetContent(node.Name)
+				t.SetStatus("Schema name copied to clipboard")
+			}),
+		}
+
+	case NodeTypeShare:
+		// Menu items for share nodes
+		menuItems = []*fyne.MenuItem{
+			fyne.NewMenuItem("Expand Share", func() {
+				t.treeWidget.OpenBranch(nodeID)
+			}),
+			fyne.NewMenuItem("Copy Share Name", func() {
+				t.w.Clipboard().SetContent(node.Name)
+				t.SetStatus("Share name copied to clipboard")
+			}),
+		}
+	}
+
+	if len(menuItems) > 0 {
+		menu := fyne.NewMenu("", menuItems...)
+		popUpMenu := widget.NewPopUpMenu(menu, t.w.Canvas())
+		popUpMenu.ShowAtPosition(e.AbsolutePosition)
+	}
+}
+
+// loadTableData loads and displays data for a table
+func (t *MainWindow) loadTableData(table delta_sharing.Table, options *QueryOptions) {
+	ds, err := delta_sharing.NewSharingClientFromString(t.profile)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("failed to create client: %w", err), t.w)
+		return
+	}
+
+	re, err := ds.ListFilesInTable(context.Background(), table)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("failed to list files: %w", err), t.w)
+		return
+	}
+
+	t.files = make([]string, 0)
+	for _, v := range re.AddFiles {
+		t.files = append(t.files, v.Id)
+	}
+
+	if len(t.files) == 0 {
+		dialog.ShowError(fmt.Errorf("no files available for table"), t.w)
+		return
+	}
+
+	fileSelected := t.files[0]
+
+	// Initialize data browser if needed
+	if t.dataBrowser == nil {
+		var db DataBrowser
+		db.CreateWindow(t.docTabs, t.SetStatus)
+		t.dataBrowser = &db
+	}
+
+	// Load data - GetData handles its own threading
+	t.dataBrowser.GetData(t.profile, table, fileSelected, options)
+}
+
+// ScanTree is deprecated - tree navigation now uses lazy loading
+// This method is kept for compatibility but does nothing
 func (t *MainWindow) ScanTree() {
-	c := make(chan bool)
-	go func(c chan bool) {
-		pbi := widget.NewProgressBarInfinite()
-		di := dialog.NewCustomWithoutButtons("Please wait", pbi, t.w)
-		di.Resize(fyne.NewSize(200, 100))
-		di.Show()
-		pbi.Start()
-		for {
-			select {
-			case <-c:
-				di.Hide()
-				pbi.Stop()
-				return
-			default:
-				time.Sleep(time.Millisecond + 500)
-			}
-		}
-	}(c)
-	ds, err := delta_sharing.NewSharingClientFromString(context.Background(), t.profile, "")
-	if err != nil {
-		dialog.NewError(err, t.w).Show()
-	}
-	ls, err := ds.ListShares()
-	if err != nil {
-		dialog.NewError(err, t.w).Show()
-	}
-	for _, v := range ls {
-		if v.Name == t.selected.share {
-			sh, err := ds.ListSchemas(v)
-			if err != nil {
-				dialog.NewError(err, t.w).Show()
-			}
-			t.schemas = make([]string, 0)
-			t.tables = make([]string, 0)
-			t.files = make([]string, 0)
-			for _, v2 := range sh {
-				t.schemas = append(t.schemas, v2.Name)
-				if v2.Name == t.selected.schema && v2.Share == t.selected.share {
-					tl, err := ds.ListTables(v2)
-					if err != nil {
-						dialog.NewError(err, t.w).Show()
-					}
-					for _, tle := range tl {
-						t.tables = append(t.tables, tle.Name)
-						if tle.Schema == t.selected.schema && tle.Share == t.selected.share && tle.Name == t.selected.table_name {
-							t.selected.table = tle
-							re, err := ds.ListFilesInTable(tle)
-							if err != nil {
-								dialog.NewError(err, t.w).Show()
-							}
-							t.files = make([]string, 0)
-							for _, v := range re.AddFiles {
-								t.files = append(t.files, v.Id)
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	c <- true
+	// No longer needed with tree-based navigation
+	// Data is loaded on-demand when tree nodes are expanded
 }

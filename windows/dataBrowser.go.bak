@@ -1,0 +1,1386 @@
+package windows
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	delta_sharing "github.com/magpierre/go_delta_sharing_client"
+)
+
+type Data struct {
+	data              [][]string
+	header            []string
+	arrow_table       arrow.Table
+	arrow_rec         arrow.Record
+	tab               *container.TabItem
+	tableName         string
+	isFiltered        bool
+	filteredData      [][]string
+	filteredHeader    []string
+	visibleColumns    []int
+	filteredRowIndices []int // Maps filtered row index to original row index
+
+	// Sorting state
+	sortedColumn      int   // Index of sorted column in filteredHeader (-1 if unsorted)
+	sortDirection     int   // 0 = unsorted, 1 = ascending, 2 = descending
+}
+
+type DataBrowser struct {
+	w              fyne.Window
+	Data           []Data
+	innerTabs      *container.DocTabs
+	docTabs        *container.DocTabs
+	browserTab     *container.TabItem
+	tabDataMap     map[*container.TabItem]*Data
+	statusCallback func(string)
+}
+
+func (t *DataBrowser) CreateWindow(docTabs *container.DocTabs, statusCallback func(string)) {
+	t.w = fyne.CurrentApp().Driver().AllWindows()[0]
+	t.docTabs = docTabs
+	t.Data = make([]Data, 0)
+	t.tabDataMap = make(map[*container.TabItem]*Data)
+	t.statusCallback = statusCallback
+
+	// Create persistent inner tabs for individual tables
+	t.innerTabs = container.NewDocTabs()
+	t.innerTabs.SetTabLocation(container.TabLocationBottom)
+
+	// Set up close intercept to clean up memory when tabs are closed
+	t.innerTabs.CloseIntercept = func(ti *container.TabItem) {
+		// Find and clean up the data associated with this tab
+		if data, exists := t.tabDataMap[ti]; exists {
+			// Release Arrow resources if they haven't been released yet
+			if data.arrow_rec != nil {
+				data.arrow_rec.Release()
+			}
+			if data.arrow_table != nil {
+				data.arrow_table.Release()
+			}
+			// Clear the data arrays to help GC
+			data.data = nil
+			data.header = nil
+			// Remove from map
+			delete(t.tabDataMap, ti)
+		}
+		// Remove the tab
+		t.innerTabs.Remove(ti)
+
+		// Update status bar to reflect the currently selected tab (if any)
+		if t.innerTabs.Selected() != nil {
+			t.updateStatusForTab(t.innerTabs.Selected())
+		} else {
+			// No tabs left, clear status
+			if t.statusCallback != nil {
+				t.statusCallback("Ready")
+			}
+		}
+	}
+
+	// Set up tab selection callback to update status bar
+	t.innerTabs.OnSelected = func(ti *container.TabItem) {
+		t.updateStatusForTab(ti)
+	}
+
+	// Create persistent Browser tab
+	t.browserTab = container.NewTabItem("Browser", t.innerTabs)
+	t.docTabs.Append(t.browserTab)
+}
+
+// updateStatusForTab updates the status bar with information about the given tab
+func (t *DataBrowser) updateStatusForTab(ti *container.TabItem) {
+	if ti == nil || t.statusCallback == nil {
+		return
+	}
+
+	// Get the data associated with this tab
+	if data, exists := t.tabDataMap[ti]; exists {
+		rowCount := len(data.data)
+		colCount := len(data.header)
+		visibleRowCount := len(data.filteredData)
+		visibleColCount := len(data.filteredHeader)
+
+		// Build status text showing total and filtered counts if applicable
+		var statusText string
+		if data.isFiltered || visibleRowCount != rowCount || visibleColCount != colCount {
+			statusText = fmt.Sprintf("Table %s (showing %d/%d columns x %d/%d rows)",
+				data.tableName, visibleColCount, colCount, visibleRowCount, rowCount)
+		} else {
+			statusText = fmt.Sprintf("Table %s (%d columns x %d rows)",
+				data.tableName, colCount, rowCount)
+		}
+
+		t.statusCallback(statusText)
+	}
+}
+
+// handleHeaderClick processes a click on a header column
+func (t *DataBrowser) handleHeaderClick(dataItem *Data, table *widget.Table, columnIndex int) {
+	// This is called when a header cell is selected (row -1)
+	t.onHeaderClick(dataItem, table, columnIndex)
+}
+
+// onHeaderClick handles the logic when a header is clicked
+func (t *DataBrowser) onHeaderClick(dataItem *Data, table *widget.Table, columnIndex int) {
+	if columnIndex < 0 || columnIndex >= len(dataItem.filteredHeader) {
+		return
+	}
+
+	// Determine new sort state
+	if dataItem.sortedColumn == columnIndex {
+		// Same column - cycle through states
+		switch dataItem.sortDirection {
+		case 0: // Currently unsorted → Ascending
+			dataItem.sortDirection = 1
+		case 1: // Currently ascending → Descending
+			dataItem.sortDirection = 2
+		case 2: // Currently descending → Unsorted
+			dataItem.sortDirection = 0
+			dataItem.sortedColumn = -1
+		}
+	} else {
+		// Different column - start with ascending
+		dataItem.sortedColumn = columnIndex
+		dataItem.sortDirection = 1
+	}
+
+	// Apply the sort (or restore to filtered order if unsorted)
+	if dataItem.sortDirection == 0 {
+		// Restore to filtered (unsorted) order
+		// Re-apply filters without sorting
+		t.restoreFilteredOrder(dataItem)
+	} else {
+		// Apply sort
+		t.applySortToData(dataItem)
+	}
+
+	// Refresh table to show changes (including headers with sort indicators)
+	table.Refresh()
+}
+
+// restoreFilteredOrder restores data to filtered but unsorted order
+func (t *DataBrowser) restoreFilteredOrder(dataItem *Data) {
+	// Sort by filteredRowIndices to restore original filtered order
+	if len(dataItem.filteredData) <= 1 {
+		return
+	}
+
+	// Create index array
+	indices := make([]int, len(dataItem.filteredData))
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort by filteredRowIndices (ascending) to restore filtered order
+	sort.Slice(indices, func(i, j int) bool {
+		return dataItem.filteredRowIndices[indices[i]] < dataItem.filteredRowIndices[indices[j]]
+	})
+
+	// Apply reordering
+	newFilteredData := make([][]string, len(dataItem.filteredData))
+	newFilteredRowIndices := make([]int, len(dataItem.filteredRowIndices))
+
+	for i, idx := range indices {
+		newFilteredData[i] = dataItem.filteredData[idx]
+		newFilteredRowIndices[i] = dataItem.filteredRowIndices[idx]
+	}
+
+	dataItem.filteredData = newFilteredData
+	dataItem.filteredRowIndices = newFilteredRowIndices
+}
+
+// getHeaderTextWithIndicator returns header text with sort indicator if applicable
+func (t *DataBrowser) getHeaderTextWithIndicator(dataItem *Data, columnIndex int) string {
+	if columnIndex < 0 || columnIndex >= len(dataItem.filteredHeader) {
+		return ""
+	}
+
+	baseText := dataItem.filteredHeader[columnIndex]
+
+	// Check if this column is sorted
+	if dataItem.sortedColumn == columnIndex {
+		switch dataItem.sortDirection {
+		case 1: // Ascending
+			return baseText + " ▲"
+		case 2: // Descending
+			return baseText + " ▼"
+		}
+	}
+
+	// Not sorted or unsorted
+	return baseText
+}
+
+func (t *DataBrowser) CreateDataBrowser(dataItem *Data, delta_table delta_sharing.Table, statusCallback func(string)) {
+	// Initialize filtered data with full dataset
+	dataItem.filteredData = dataItem.data
+	dataItem.filteredHeader = dataItem.header
+	dataItem.visibleColumns = make([]int, len(dataItem.header))
+	for i := range dataItem.visibleColumns {
+		dataItem.visibleColumns[i] = i
+	}
+	// Initialize row indices to match all rows
+	dataItem.filteredRowIndices = make([]int, len(dataItem.data))
+	for i := range dataItem.filteredRowIndices {
+		dataItem.filteredRowIndices[i] = i
+	}
+
+	// Initialize sorting state
+	dataItem.sortedColumn = -1
+	dataItem.sortDirection = 0
+
+	// Create the table widget
+	table := widget.NewTableWithHeaders(func() (rows int, cols int) {
+		if len(dataItem.filteredData) == 0 {
+			return 0, len(dataItem.filteredHeader)
+		}
+		return len(dataItem.filteredData), len(dataItem.filteredHeader)
+	}, func() fyne.CanvasObject {
+		return widget.NewLabel("template.............")
+	}, func(tci widget.TableCellID, co fyne.CanvasObject) {
+		if tci.Row < len(dataItem.filteredData) && tci.Col < len(dataItem.filteredHeader) {
+			co.(*widget.Label).SetText(dataItem.filteredData[tci.Row][tci.Col])
+			co.(*widget.Label).Truncation = fyne.TextTruncateClip
+		}
+	})
+
+	table.ShowHeaderColumn = false
+
+	// Create clickable header labels that look like regular table headers
+	table.CreateHeader = func() fyne.CanvasObject {
+		label := widget.NewLabel("Header")
+		label.TextStyle = fyne.TextStyle{Bold: true}
+		label.Alignment = fyne.TextAlignCenter
+		// Wrap label in a tappable container
+		return container.NewStack(label)
+	}
+
+	table.UpdateHeader = func(id widget.TableCellID, template fyne.CanvasObject) {
+		if id.Col < len(dataItem.filteredHeader) {
+			// Safely get the container and label
+			var stack *fyne.Container
+			var label *widget.Label
+
+			// Handle both initial creation and refresh scenarios
+			if cont, ok := template.(*fyne.Container); ok {
+				stack = cont
+				// Find the label in the container
+				for _, obj := range stack.Objects {
+					if lbl, ok := obj.(*widget.Label); ok {
+						label = lbl
+						break
+					}
+				}
+			} else {
+				// If template is not a container, something went wrong - skip this update
+				return
+			}
+
+			if label == nil {
+				return
+			}
+
+			// Get header text with sort indicator
+			headerText := t.getHeaderTextWithIndicator(dataItem, id.Col)
+			label.SetText(headerText)
+
+			// Make the label tappable by adding tap handler
+			// We need to store the column index for the closure
+			columnIndex := id.Col
+
+			// Check if we already have a button in the stack
+			hasButton := false
+			for _, obj := range stack.Objects {
+				if _, ok := obj.(*widget.Button); ok {
+					hasButton = true
+					break
+				}
+			}
+
+			// Only add button if we don't have one yet
+			if !hasButton {
+				// Create a custom tappable widget that doesn't obscure the label
+				tappable := &widget.Button{
+					Text:       "",
+					Icon:       nil,
+					Importance: widget.LowImportance,
+					OnTapped: func() {
+						t.handleHeaderClick(dataItem, table, columnIndex)
+					},
+				}
+				// Set the button to be behind the label, not on top
+				stack.Objects = append([]fyne.CanvasObject{tappable}, label)
+			}
+		}
+	}
+
+	// Calculate and set column widths based on header text
+	for i, headerText := range dataItem.header {
+		// Measure the header text width and add padding
+		textSize := fyne.MeasureText(headerText, theme.TextSize(), fyne.TextStyle{})
+		columnWidth := textSize.Width + theme.Padding()*4 // Add padding for better spacing
+
+		// Ensure a minimum width
+		if columnWidth < 80 {
+			columnWidth = 80
+		}
+
+		table.SetColumnWidth(i, columnWidth)
+	}
+
+	// Create search/filter controls
+	searchEntry := widget.NewEntry()
+	searchEntry.SetPlaceHolder("Search: text or column=value, column>10, name~'John' AND age>=18 OR status='active'")
+
+	// Create column filter UI
+	columnChecks := make(map[string]*widget.Check)
+	columnFilterContainer := container.NewVBox()
+
+	for _, colName := range dataItem.header {
+		check := widget.NewCheck(colName, nil)
+		check.Checked = true
+		columnChecks[colName] = check
+		columnFilterContainer.Add(check)
+	}
+
+	columnFilterScroll := container.NewVScroll(columnFilterContainer)
+	columnFilterScroll.SetMinSize(fyne.NewSize(200, 200))
+
+	columnFilterCard := widget.NewCard("", "Select Columns", columnFilterScroll)
+
+	// Create query parser
+	queryParser := NewQueryParser(dataItem.header)
+	var errorLabel *widget.Label
+
+	// Track last valid query to avoid re-filtering on incomplete expressions
+	var lastValidQuery *Query
+
+	// Declare applyFilters function variable
+	var applyFilters func()
+
+	// Create search button (after declaring applyFilters)
+	searchButton := widget.NewButtonWithIcon("Search", theme.SearchIcon(), func() {
+		applyFilters()
+	})
+
+	// Create clear search button
+	clearSearchBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), func() {
+		searchEntry.SetText("")
+		applyFilters() // Apply filters to show all records
+	})
+
+	// Define the applyFilters function
+	applyFilters = func() {
+		searchText := strings.TrimSpace(searchEntry.Text)
+
+		// Save sorted column name before updating filteredHeader (NEW)
+		var sortedColumnName string
+		if dataItem.sortedColumn >= 0 && dataItem.sortedColumn < len(dataItem.filteredHeader) {
+			sortedColumnName = dataItem.filteredHeader[dataItem.sortedColumn]
+		}
+
+		// Filter columns
+		visibleCols := make([]int, 0)
+		filteredHeader := make([]string, 0)
+
+		for i, colName := range dataItem.header {
+			if check, exists := columnChecks[colName]; exists && check.Checked {
+				visibleCols = append(visibleCols, i)
+				filteredHeader = append(filteredHeader, colName)
+			}
+		}
+
+		dataItem.visibleColumns = visibleCols
+		dataItem.filteredHeader = filteredHeader
+
+		// Check if sorted column is still visible (NEW)
+		if sortedColumnName != "" {
+			newSortedCol := -1
+			for i, colName := range filteredHeader {
+				if colName == sortedColumnName {
+					newSortedCol = i
+					break
+				}
+			}
+
+			if newSortedCol == -1 {
+				// Sorted column is now hidden - reset sort
+				dataItem.sortedColumn = -1
+				dataItem.sortDirection = 0
+			} else {
+				// Update sorted column index to new position
+				dataItem.sortedColumn = newSortedCol
+			}
+		}
+
+		// Parse query
+		query, err := queryParser.ParseQuery(searchText)
+		if err != nil {
+			// Show error but don't filter - use last valid query
+			if errorLabel != nil {
+				errorLabel.SetText(fmt.Sprintf("Query error: %v", err))
+				errorLabel.Show()
+			}
+			// Keep using last valid query for filtering
+			query = lastValidQuery
+		} else {
+			// Hide error label if query is valid
+			if errorLabel != nil {
+				errorLabel.Hide()
+			}
+			// Update last valid query
+			lastValidQuery = query
+		}
+
+		// Filter rows based on query
+		if query == nil || len(query.Expressions) == 0 {
+			// No search filter - show all rows with visible columns
+			filteredData := make([][]string, len(dataItem.data))
+			filteredRowIndices := make([]int, len(dataItem.data))
+			for i, row := range dataItem.data {
+				newRow := make([]string, len(visibleCols))
+				for j, colIdx := range visibleCols {
+					newRow[j] = row[colIdx]
+				}
+				filteredData[i] = newRow
+				filteredRowIndices[i] = i
+			}
+			dataItem.filteredData = filteredData
+			dataItem.filteredRowIndices = filteredRowIndices
+		} else {
+			// Apply query filter
+			filteredData := make([][]string, 0)
+			filteredRowIndices := make([]int, 0)
+			for rowIdx, row := range dataItem.data {
+				// Evaluate query against full row
+				if queryParser.EvaluateRow(query, row, dataItem.header) {
+					// Create filtered row with only visible columns
+					newRow := make([]string, len(visibleCols))
+					for j, colIdx := range visibleCols {
+						newRow[j] = row[colIdx]
+					}
+					filteredData = append(filteredData, newRow)
+					filteredRowIndices = append(filteredRowIndices, rowIdx)
+				}
+			}
+			dataItem.filteredData = filteredData
+			dataItem.filteredRowIndices = filteredRowIndices
+		}
+
+		// Re-apply sorting after filtering (NEW)
+		t.applySortToData(dataItem)
+
+		table.Refresh()
+
+		// Update status bar to reflect filter changes
+		if dataItem.tab != nil {
+			t.updateStatusForTab(dataItem.tab)
+		}
+	}
+
+	// Connect search entry to filter only on Enter key
+	searchEntry.OnSubmitted = func(string) {
+		applyFilters()
+	}
+
+	// Add change handlers to column checkboxes
+	for _, check := range columnChecks {
+		check.OnChanged = func(bool) {
+			applyFilters()
+		}
+	}
+
+	// Create filter buttons for column selection
+	selectAllBtn := widget.NewButton("Select All", func() {
+		for _, check := range columnChecks {
+			check.SetChecked(true)
+		}
+		applyFilters()
+	})
+
+	deselectAllBtn := widget.NewButton("Deselect All", func() {
+		for _, check := range columnChecks {
+			check.SetChecked(false)
+		}
+		applyFilters()
+	})
+
+	filterButtons := container.NewHBox(selectAllBtn, deselectAllBtn)
+
+	// Combine search and column filter in an accordion
+	filterAccordion := widget.NewAccordion(
+		widget.NewAccordionItem("Column Filter", container.NewBorder(filterButtons, nil, nil, nil, columnFilterCard)),
+	)
+
+	// Create table info for status bar
+	rowCount := len(dataItem.data)
+	colCount := len(dataItem.header)
+	statusText := fmt.Sprintf("Table %s (%d columns x %d rows)", delta_table.Name, colCount, rowCount)
+
+	// Update status bar with table info
+	if statusCallback != nil {
+		statusCallback(statusText)
+	}
+
+	// Create error label for query parsing errors
+	errorLabel = widget.NewLabel("")
+	errorLabel.Wrapping = fyne.TextWrapWord
+	errorLabel.Importance = widget.HighImportance
+	errorLabel.Hide()
+
+	// Create search bar with entry and buttons
+	searchButtonsContainer := container.NewHBox(searchButton, clearSearchBtn)
+	searchBar := container.NewBorder(nil, nil, nil, searchButtonsContainer, searchEntry)
+
+	// Create row search label
+	rowSearchLabel := widget.NewLabel("Row Search (Press Enter or click Search button):")
+
+	// Combine row search and column filter in a container
+	filterContent := container.NewVBox(
+		rowSearchLabel,
+		searchBar,
+		errorLabel,
+		widget.NewSeparator(),
+		filterAccordion,
+	)
+
+	// Create main filter accordion that contains both row and column filters (starts closed)
+	mainFilterAccordion := widget.NewAccordion(
+		widget.NewAccordionItem("Filters", filterContent),
+	)
+
+	// Combine filters and table in a vertical layout (removed the card title)
+	content := container.NewBorder(
+		container.NewVBox(
+			mainFilterAccordion,
+			widget.NewSeparator(),
+		),
+		nil, nil, nil,
+		table,
+	)
+
+	// Add new tab to the persistent inner tabs
+	// Append " filtered" to tab name if filtering was applied
+	tabName := delta_table.Name
+	if dataItem.isFiltered {
+		tabName = delta_table.Name + " filtered"
+	}
+	newTab := container.NewTabItem(tabName, content)
+
+	// Store the tab reference in the data item and register in map
+	dataItem.tab = newTab
+	dataItem.tableName = delta_table.Name
+	t.tabDataMap[newTab] = dataItem
+
+	t.innerTabs.Append(newTab)
+
+	// Select the newly added tab (this will trigger the OnSelected callback which updates status)
+	t.innerTabs.Select(newTab)
+
+	// Check if Browser tab still exists in docTabs, if not recreate it
+	browserExists := false
+	for _, item := range t.docTabs.Items {
+		if item == t.browserTab {
+			browserExists = true
+			break
+		}
+	}
+
+	if !browserExists {
+		// Recreate the Browser tab
+		t.browserTab = container.NewTabItem("Browser", t.innerTabs)
+		t.docTabs.Append(t.browserTab)
+	}
+
+	// Select the Browser tab in the main tabs
+	t.docTabs.Select(t.browserTab)
+}
+
+func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id string, options *QueryOptions) {
+	c := make(chan bool)
+	go func(c chan bool) {
+		pbi := widget.NewProgressBarInfinite()
+
+		di := dialog.NewCustomWithoutButtons("Please wait", pbi, t.w)
+		di.Resize(fyne.NewSize(200, 100))
+		di.Show()
+		pbi.Start()
+		for {
+			select {
+			case <-c:
+				di.Hide()
+				pbi.Stop()
+				return
+			default:
+				time.Sleep(time.Millisecond + 500)
+			}
+		}
+	}(c)
+	ds, err := delta_sharing.NewSharingClientFromString(profile)
+	if err != nil {
+		dialog.NewError(err, t.w).Show()
+	}
+	resp, err := ds.ListFilesInTable(context.Background(), table)
+	if err != nil {
+		dialog.NewError(err, t.w).Show()
+	}
+	var data Data
+	for _, v := range resp.AddFiles {
+		if v.Id == file_id {
+			arrow_table, err := delta_sharing.LoadArrowTable(context.Background(), ds, table, file_id)
+			if err != nil {
+				dialog.NewError(err, t.w).Show()
+			}
+			data.arrow_table = arrow_table
+
+			// Apply query options if provided
+			if options != nil {
+				data.arrow_table, err = t.applyQueryOptions(data.arrow_table, options)
+				if err != nil {
+					dialog.ShowError(fmt.Errorf("failed to apply query options: %w", err), t.w)
+					c <- true
+					return
+				}
+				// Mark data as filtered when options are applied
+				data.isFiltered = true
+			}
+
+			data.arrow_table, err = t.test(data.arrow_table)
+			if err != nil {
+				dialog.ShowError(fmt.Errorf("failed to process table: %w", err), t.w)
+				c <- true
+				return
+			}
+			var header []string = make([]string, data.arrow_table.NumCols())
+			for i, f := range data.arrow_table.Schema().Fields() {
+				header[i] = f.Name
+			}
+
+			data.data = make([][]string, 0)
+			data.header = header
+
+			// Determine batch size based on limit
+			batchSize := int64(1000)
+			if options != nil && options.Limit > 0 && options.Limit < batchSize {
+				batchSize = options.Limit
+			}
+
+			tr := array.NewTableReader(data.arrow_table, batchSize)
+			tr.Retain()
+			tr.Next()
+			data.arrow_rec = tr.Record()
+			t.Data = append(t.Data, data)
+			dt := t.parseRecord(options)
+
+			t.CreateDataBrowser(dt, table, t.statusCallback)
+
+			c <- true
+			t.w.Content().Refresh()
+		}
+	}
+}
+
+func (t *DataBrowser) parseRecord(options *QueryOptions) *Data {
+	dp := len(t.Data) - 1
+	maxRows := int(t.Data[dp].arrow_rec.NumRows())
+
+	// Apply row limit if specified
+	if options != nil && options.Limit > 0 && int(options.Limit) < maxRows {
+		maxRows = int(options.Limit)
+	}
+
+	for pos := 0; pos < maxRows; pos++ {
+		var v []string = make([]string, t.Data[dp].arrow_rec.NumCols())
+		for i, col := range t.Data[dp].arrow_rec.Columns() {
+			switch col.DataType().ID() {
+			case arrow.STRUCT:
+				s := col.(*array.Struct)
+
+				b, err := s.MarshalJSON()
+				if err != nil {
+					log.Fatal(err)
+				}
+				v[i] = string(b)
+
+			case arrow.LIST:
+				as := array.NewSlice(col, int64(pos), int64(pos+1))
+				str := fmt.Sprintf("%v", as)
+				if len(str) > 253 {
+					v[i] = str[1:253] + "..."
+				} else {
+					v[i] = str
+				}
+			case arrow.STRING:
+				s := col.(*array.String)
+				v[i] = s.Value(pos)
+			case arrow.BINARY:
+				b := col.(*array.Binary)
+				v[i] = string(b.Value(pos))
+			case arrow.BOOL:
+				b := col.(*array.Boolean)
+				v[i] = fmt.Sprintf("%v", b.Value(pos))
+			case arrow.DATE32:
+				d32 := col.(*array.Date32)
+				v[i] = d32.Value(pos).ToTime().String()
+			case arrow.DATE64:
+				d64 := col.(*array.Date64)
+				v[i] = d64.Value(pos).ToTime().String()
+			case arrow.DECIMAL:
+				d128 := col.(*array.Decimal128)
+				v[i] = d128.Value(pos).BigInt().String()
+			case arrow.INT8:
+				i8 := col.(*array.Int8)
+				v[i] = fmt.Sprintf("%d", i8.Value(pos))
+			case arrow.INT16:
+				i16 := col.(*array.Int16)
+				v[i] = fmt.Sprintf("%d", i16.Value(pos))
+			case arrow.INT32:
+				i32 := col.(*array.Int32)
+				v[i] = fmt.Sprintf("%d", i32.Value(pos))
+			case arrow.INT64:
+				i64 := col.(*array.Int64)
+				v[i] = fmt.Sprintf("%d", i64.Value(pos))
+			case arrow.FLOAT16:
+				f16 := col.(*array.Float16)
+				v[i] = f16.Value(pos).String()
+			case arrow.FLOAT32:
+				f32 := col.(*array.Float32)
+				v[i] = fmt.Sprintf("%.2f", f32.Value(pos))
+			case arrow.FLOAT64:
+				f64 := col.(*array.Float64)
+				v[i] = fmt.Sprintf("%.2f", f64.Value(pos))
+			case arrow.INTERVAL_MONTHS:
+				intV := col.(*array.DayTimeInterval)
+				v[i] = fmt.Sprintf("%v", intV.Value(pos))
+			case arrow.INTERVAL_DAY_TIME:
+				intV := col.(*array.DayTimeInterval)
+				v[i] = fmt.Sprintf("%v", intV.Value(pos))
+			case arrow.TIMESTAMP:
+				ts := col.(*array.Timestamp)
+				v[i] = ts.Value(pos).ToTime(arrow.Nanosecond).String()
+			}
+		}
+		t.Data[dp].data = append(t.Data[dp].data, v)
+	}
+	// Don't release Arrow resources here - they will be released when the tab is closed
+	// t.Data[dp].arrow_rec.Release()
+	// t.Data[dp].arrow_table.Release()
+	return &t.Data[dp]
+}
+
+func (d *DataBrowser) test(t arrow.Table) (arrow.Table, error) {
+	/* table := t
+
+	pool := compute.GetAllocator(context.Background())
+	intBuilder := array.NewFloat32Builder(pool)
+	intBuilder.Append(21)
+	a := intBuilder.NewArray()
+	//c := compute.Equal(compute.NewFieldRef("deaths"), compute.NewLiteral(21))
+	tab2, err := compute.FilterTable(context.Background(), table, compute.NewDatum(a), compute.DefaultFilterOptions())
+	if err != nil {
+		return nil, err
+	}
+	*/
+	return t, nil
+}
+
+// applyQueryOptions applies column selection and row limiting to the Arrow table
+func (d *DataBrowser) applyQueryOptions(table arrow.Table, options *QueryOptions) (arrow.Table, error) {
+	if options == nil {
+		return table, nil
+	}
+
+	// Apply column selection if specified
+	if len(options.SelectedColumns) > 0 {
+		// Build list of column indices to keep
+		schema := table.Schema()
+		colIndices := make([]int, 0)
+		colNames := make(map[string]bool)
+
+		for _, colName := range options.SelectedColumns {
+			colNames[colName] = true
+		}
+
+		for i, field := range schema.Fields() {
+			if colNames[field.Name] {
+				colIndices = append(colIndices, i)
+			}
+		}
+
+		if len(colIndices) == 0 {
+			return nil, fmt.Errorf("no matching columns found")
+		}
+
+		// Create new schema with selected columns
+		selectedFields := make([]arrow.Field, len(colIndices))
+		for i, idx := range colIndices {
+			selectedFields[i] = schema.Field(idx)
+		}
+		newSchema := arrow.NewSchema(selectedFields, nil)
+
+		// Create new columns array
+		columns := make([]arrow.Column, len(colIndices))
+		for i, idx := range colIndices {
+			col := table.Column(idx)
+			columns[i] = *col
+		}
+
+		// Create new table with selected columns
+		table = array.NewTable(newSchema, columns, table.NumRows())
+	}
+
+	// Apply row limit if specified
+	if options.Limit > 0 && options.Limit < table.NumRows() {
+		// Create a new table with limited rows
+		numCols := int(table.NumCols())
+		columns := make([]arrow.Column, numCols)
+		for i := 0; i < numCols; i++ {
+			col := table.Column(i)
+			// Get the chunked array and slice it
+			chunks := col.Data().Chunks()
+			newChunks := make([]arrow.Array, 0)
+			rowCount := int64(0)
+
+			for _, chunk := range chunks {
+				if rowCount >= options.Limit {
+					break
+				}
+				remaining := options.Limit - rowCount
+				if int64(chunk.Len()) <= remaining {
+					newChunks = append(newChunks, chunk)
+					rowCount += int64(chunk.Len())
+				} else {
+					// Slice the chunk
+					sliced := array.NewSlice(chunk, 0, remaining)
+					newChunks = append(newChunks, sliced)
+					rowCount += remaining
+				}
+			}
+
+			chunked := arrow.NewChunked(col.DataType(), newChunks)
+			columns[i] = *arrow.NewColumn(col.Field(), chunked)
+		}
+
+		table = array.NewTable(table.Schema(), columns, options.Limit)
+	}
+
+	// Note: Predicate filtering would require more complex SQL parsing
+	// For now, we'll skip predicate filtering if provided
+	// This is a placeholder for future implementation
+
+	return table, nil
+}
+
+// exportData handles the export of data to different formats
+func (t *DataBrowser) exportData(dataItem *Data, format ExportFormat, tableName string) {
+	// Determine file extension based on format
+	var ext string
+	switch format {
+	case FormatParquet:
+		ext = ".parquet"
+	case FormatCSV:
+		ext = ".csv"
+	case FormatJSON:
+		ext = ".json"
+	}
+
+	// Create file save dialog
+	saveDialog := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, t.w)
+			return
+		}
+		if writer == nil {
+			// User cancelled
+			return
+		}
+		defer writer.Close()
+
+		// Get the file path
+		filePath := writer.URI().Path()
+
+		// Show progress indicator
+		pbi := widget.NewProgressBarInfinite()
+		progressDialog := dialog.NewCustomWithoutButtons("Exporting...", pbi, t.w)
+		progressDialog.Resize(fyne.NewSize(300, 100))
+		progressDialog.Show()
+		pbi.Start()
+
+		// Export in a goroutine
+		go func() {
+			var exportErr error
+
+			// Convert filtered data to Arrow table for export
+			filteredTable, convErr := t.createFilteredArrowTable(dataItem)
+			if convErr != nil {
+				pbi.Stop()
+				progressDialog.Hide()
+				dialog.ShowError(fmt.Errorf("failed to prepare filtered data: %w", convErr), t.w)
+				return
+			}
+			defer filteredTable.Release()
+
+			switch format {
+			case FormatParquet:
+				exportErr = ExportToParquet(filteredTable, filePath)
+			case FormatCSV:
+				exportErr = ExportToCSV(filteredTable, filePath)
+			case FormatJSON:
+				exportErr = ExportToJSON(filteredTable, filePath)
+			}
+
+			// Hide progress dialog
+			pbi.Stop()
+			progressDialog.Hide()
+
+			// Show result
+			if exportErr != nil {
+				dialog.ShowError(fmt.Errorf("export failed: %w", exportErr), t.w)
+			} else {
+				dialog.ShowInformation("Export Successful",
+					fmt.Sprintf("Data exported successfully to:\n%s", filePath), t.w)
+			}
+		}()
+	}, t.w)
+
+	// Set default filename
+	defaultName := strings.ReplaceAll(tableName, " ", "_") + ext
+	saveDialog.SetFileName(defaultName)
+
+	// Set file filter
+	saveDialog.SetFilter(storage.NewExtensionFileFilter([]string{ext}))
+
+	saveDialog.Show()
+}
+
+// createFilteredArrowTable creates an Arrow table from the filtered data
+func (t *DataBrowser) createFilteredArrowTable(dataItem *Data) (arrow.Table, error) {
+	if len(dataItem.filteredData) == 0 {
+		return nil, fmt.Errorf("no data to export")
+	}
+
+	// Get the original schema to determine column types
+	originalSchema := dataItem.arrow_table.Schema()
+
+	// Build new schema with only visible columns
+	newFields := make([]arrow.Field, len(dataItem.visibleColumns))
+	for i, colIdx := range dataItem.visibleColumns {
+		newFields[i] = originalSchema.Field(colIdx)
+	}
+	schema := arrow.NewSchema(newFields, nil)
+
+	// Create memory pool
+	pool := memory.NewGoAllocator()
+
+	// Get table reader to access typed values (shared across all columns)
+	tr := array.NewTableReader(dataItem.arrow_table, dataItem.arrow_table.NumRows())
+	defer tr.Release()
+	tr.Next()
+	rec := tr.Record()
+
+	// Build Arrow arrays for each column using the tracked row indices
+	columns := make([]arrow.Column, len(dataItem.visibleColumns))
+	for i, colIdx := range dataItem.visibleColumns {
+		field := originalSchema.Field(colIdx)
+
+		// Create builder based on data type
+		builder := array.NewBuilder(pool, field.Type)
+		defer builder.Release()
+
+		// Append values from the original Arrow column using tracked indices
+		// filteredRowIndices maps filtered row position to original row position
+		for _, originalRowIdx := range dataItem.filteredRowIndices {
+			col := rec.Column(colIdx)
+			appendValueToBuilder(builder, col, originalRowIdx)
+		}
+
+		// Build the array
+		arr := builder.NewArray()
+		defer arr.Release()
+
+		// Create chunked array
+		chunked := arrow.NewChunked(field.Type, []arrow.Array{arr})
+		columns[i] = *arrow.NewColumn(field, chunked)
+	}
+
+	// Create and return the table
+	return array.NewTable(schema, columns, int64(len(dataItem.filteredData))), nil
+}
+
+// formatValueFromArray formats a value from an Arrow array (helper for matching)
+func formatValueFromArray(col arrow.Array, pos int) string {
+	if col.IsNull(pos) {
+		return ""
+	}
+
+	switch col.DataType().ID() {
+	case arrow.STRUCT:
+		s := col.(*array.Struct)
+		b, _ := s.MarshalJSON()
+		return string(b)
+	case arrow.LIST:
+		as := array.NewSlice(col, int64(pos), int64(pos+1))
+		str := fmt.Sprintf("%v", as)
+		if len(str) > 253 {
+			return str[1:253] + "..."
+		}
+		return str
+	case arrow.STRING:
+		s := col.(*array.String)
+		return s.Value(pos)
+	case arrow.BINARY:
+		b := col.(*array.Binary)
+		return string(b.Value(pos))
+	case arrow.BOOL:
+		b := col.(*array.Boolean)
+		return fmt.Sprintf("%v", b.Value(pos))
+	case arrow.DATE32:
+		d32 := col.(*array.Date32)
+		return d32.Value(pos).ToTime().String()
+	case arrow.DATE64:
+		d64 := col.(*array.Date64)
+		return d64.Value(pos).ToTime().String()
+	case arrow.DECIMAL:
+		d128 := col.(*array.Decimal128)
+		return d128.Value(pos).BigInt().String()
+	case arrow.INT8:
+		i8 := col.(*array.Int8)
+		return fmt.Sprintf("%d", i8.Value(pos))
+	case arrow.INT16:
+		i16 := col.(*array.Int16)
+		return fmt.Sprintf("%d", i16.Value(pos))
+	case arrow.INT32:
+		i32 := col.(*array.Int32)
+		return fmt.Sprintf("%d", i32.Value(pos))
+	case arrow.INT64:
+		i64 := col.(*array.Int64)
+		return fmt.Sprintf("%d", i64.Value(pos))
+	case arrow.FLOAT16:
+		f16 := col.(*array.Float16)
+		return f16.Value(pos).String()
+	case arrow.FLOAT32:
+		f32 := col.(*array.Float32)
+		return fmt.Sprintf("%.2f", f32.Value(pos))
+	case arrow.FLOAT64:
+		f64 := col.(*array.Float64)
+		return fmt.Sprintf("%.2f", f64.Value(pos))
+	case arrow.TIMESTAMP:
+		ts := col.(*array.Timestamp)
+		return ts.Value(pos).ToTime(arrow.Nanosecond).String()
+	default:
+		return fmt.Sprintf("%v", col)
+	}
+}
+
+// appendValueToBuilder appends a typed value from an Arrow array to a builder
+func appendValueToBuilder(builder array.Builder, col arrow.Array, pos int) {
+	if col.IsNull(pos) {
+		builder.AppendNull()
+		return
+	}
+
+	switch col.DataType().ID() {
+	case arrow.STRING:
+		b := builder.(*array.StringBuilder)
+		s := col.(*array.String)
+		b.Append(s.Value(pos))
+	case arrow.BINARY:
+		b := builder.(*array.BinaryBuilder)
+		bin := col.(*array.Binary)
+		b.Append(bin.Value(pos))
+	case arrow.BOOL:
+		b := builder.(*array.BooleanBuilder)
+		bl := col.(*array.Boolean)
+		b.Append(bl.Value(pos))
+	case arrow.INT8:
+		b := builder.(*array.Int8Builder)
+		i8 := col.(*array.Int8)
+		b.Append(i8.Value(pos))
+	case arrow.INT16:
+		b := builder.(*array.Int16Builder)
+		i16 := col.(*array.Int16)
+		b.Append(i16.Value(pos))
+	case arrow.INT32:
+		b := builder.(*array.Int32Builder)
+		i32 := col.(*array.Int32)
+		b.Append(i32.Value(pos))
+	case arrow.INT64:
+		b := builder.(*array.Int64Builder)
+		i64 := col.(*array.Int64)
+		b.Append(i64.Value(pos))
+	case arrow.UINT8:
+		b := builder.(*array.Uint8Builder)
+		u8 := col.(*array.Uint8)
+		b.Append(u8.Value(pos))
+	case arrow.UINT16:
+		b := builder.(*array.Uint16Builder)
+		u16 := col.(*array.Uint16)
+		b.Append(u16.Value(pos))
+	case arrow.UINT32:
+		b := builder.(*array.Uint32Builder)
+		u32 := col.(*array.Uint32)
+		b.Append(u32.Value(pos))
+	case arrow.UINT64:
+		b := builder.(*array.Uint64Builder)
+		u64 := col.(*array.Uint64)
+		b.Append(u64.Value(pos))
+	case arrow.FLOAT16:
+		b := builder.(*array.Float16Builder)
+		f16 := col.(*array.Float16)
+		b.Append(f16.Value(pos))
+	case arrow.FLOAT32:
+		b := builder.(*array.Float32Builder)
+		f32 := col.(*array.Float32)
+		b.Append(f32.Value(pos))
+	case arrow.FLOAT64:
+		b := builder.(*array.Float64Builder)
+		f64 := col.(*array.Float64)
+		b.Append(f64.Value(pos))
+	case arrow.DATE32:
+		b := builder.(*array.Date32Builder)
+		d32 := col.(*array.Date32)
+		b.Append(d32.Value(pos))
+	case arrow.DATE64:
+		b := builder.(*array.Date64Builder)
+		d64 := col.(*array.Date64)
+		b.Append(d64.Value(pos))
+	case arrow.TIMESTAMP:
+		b := builder.(*array.TimestampBuilder)
+		ts := col.(*array.Timestamp)
+		b.Append(ts.Value(pos))
+	case arrow.DECIMAL128:
+		b := builder.(*array.Decimal128Builder)
+		d128 := col.(*array.Decimal128)
+		b.Append(d128.Value(pos))
+	case arrow.STRUCT:
+		// For struct types, we need to handle nested builders
+		b := builder.(*array.StructBuilder)
+		s := col.(*array.Struct)
+		b.Append(true) // Mark as valid
+		// Copy field values
+		for i := 0; i < s.NumField(); i++ {
+			fieldBuilder := b.FieldBuilder(i)
+			fieldCol := s.Field(i)
+			appendValueToBuilder(fieldBuilder, fieldCol, pos)
+		}
+	case arrow.LIST:
+		// For list types, handle nested values
+		b := builder.(*array.ListBuilder)
+		l := col.(*array.List)
+		b.Append(true)
+		valueBuilder := b.ValueBuilder()
+		offsets := l.Offsets()
+		start := int(offsets[pos])
+		end := int(offsets[pos+1])
+		values := l.ListValues()
+		for i := start; i < end; i++ {
+			appendValueToBuilder(valueBuilder, values, i)
+		}
+	default:
+		// For unsupported types, append null
+		builder.AppendNull()
+	}
+}
+
+// getColumnType returns the Arrow data type for a column
+func (t *DataBrowser) getColumnType(dataItem *Data, colIndex int) arrow.DataType {
+	if colIndex < 0 || colIndex >= len(dataItem.visibleColumns) {
+		return nil
+	}
+
+	// Map filtered column index to original column index
+	originalColIndex := dataItem.visibleColumns[colIndex]
+
+	// Get type from Arrow schema
+	if dataItem.arrow_table != nil {
+		schema := dataItem.arrow_table.Schema()
+		if originalColIndex < len(schema.Fields()) {
+			return schema.Field(originalColIndex).Type
+		}
+	}
+
+	return nil
+}
+
+// parseValueForComparison converts a string value to a comparable form based on type
+func parseValueForComparison(value string, dataType arrow.DataType) interface{} {
+	if value == "" || dataType == nil {
+		return value // Empty values sort as strings
+	}
+
+	switch dataType.ID() {
+	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64:
+		// Parse as integer
+		if val, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return float64(val)
+		}
+		return value
+
+	case arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
+		// Parse as unsigned integer
+		if val, err := strconv.ParseUint(value, 10, 64); err == nil {
+			return float64(val)
+		}
+		return value
+
+	case arrow.FLOAT16, arrow.FLOAT32, arrow.FLOAT64:
+		// Parse as float
+		if val, err := strconv.ParseFloat(value, 64); err == nil {
+			return val
+		}
+		return value
+
+	case arrow.DECIMAL128:
+		// Parse decimal as float
+		if val, err := strconv.ParseFloat(value, 64); err == nil {
+			return val
+		}
+		return value
+
+	case arrow.DATE32, arrow.DATE64, arrow.TIMESTAMP:
+		// Parse date/time - try multiple formats
+		formats := []string{
+			time.RFC3339,
+			"2006-01-02 15:04:05.999999999 -0700 MST",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		}
+		for _, format := range formats {
+			if t, err := time.Parse(format, value); err == nil {
+				return t.Unix() // Return Unix timestamp for comparison
+			}
+		}
+		return value
+
+	case arrow.BOOL:
+		// Parse boolean
+		if val, err := strconv.ParseBool(value); err == nil {
+			if val {
+				return 1.0
+			}
+			return 0.0
+		}
+		return value
+
+	default:
+		// For all other types (STRING, BINARY, STRUCT, LIST, etc.), compare as strings
+		return strings.ToLower(value) // Case-insensitive string comparison
+	}
+}
+
+// compareValues compares two values and returns -1, 0, or 1
+// Returns: -1 if a < b, 0 if a == b, 1 if a > b
+func compareValues(a, b interface{}) int {
+	// Handle nil/empty values
+	aStr, aIsString := a.(string)
+	bStr, bIsString := b.(string)
+
+	if aIsString && aStr == "" {
+		if bIsString && bStr == "" {
+			return 0 // Both empty
+		}
+		return 1 // Empty values sort to end
+	}
+	if bIsString && bStr == "" {
+		return -1 // Non-empty sorts before empty
+	}
+
+	// Compare by type
+	switch aVal := a.(type) {
+	case float64:
+		if bVal, ok := b.(float64); ok {
+			if aVal < bVal {
+				return -1
+			} else if aVal > bVal {
+				return 1
+			}
+			return 0
+		}
+
+	case string:
+		if bVal, ok := b.(string); ok {
+			return strings.Compare(aVal, bVal)
+		}
+	}
+
+	// Fallback: convert both to strings and compare
+	return strings.Compare(fmt.Sprintf("%v", a), fmt.Sprintf("%v", b))
+}
+
+// sortData sorts the filtered data by the specified column
+func (t *DataBrowser) sortData(dataItem *Data, columnIndex int, ascending bool) {
+	if columnIndex < 0 || columnIndex >= len(dataItem.filteredHeader) {
+		return // Invalid column index
+	}
+
+	if len(dataItem.filteredData) <= 1 {
+		return // Nothing to sort
+	}
+
+	// Get column type for type-aware sorting
+	colType := t.getColumnType(dataItem, columnIndex)
+
+	// Create a slice of indices to sort
+	indices := make([]int, len(dataItem.filteredData))
+	for i := range indices {
+		indices[i] = i
+	}
+
+	// Sort indices based on column values
+	sort.Slice(indices, func(i, j int) bool {
+		// Get values
+		valA := dataItem.filteredData[indices[i]][columnIndex]
+		valB := dataItem.filteredData[indices[j]][columnIndex]
+
+		// Parse values based on type
+		parsedA := parseValueForComparison(valA, colType)
+		parsedB := parseValueForComparison(valB, colType)
+
+		// Compare
+		cmp := compareValues(parsedA, parsedB)
+
+		if ascending {
+			return cmp < 0
+		}
+		return cmp > 0
+	})
+
+	// Apply the sort by reordering both filteredData and filteredRowIndices
+	newFilteredData := make([][]string, len(dataItem.filteredData))
+	newFilteredRowIndices := make([]int, len(dataItem.filteredRowIndices))
+
+	for i, idx := range indices {
+		newFilteredData[i] = dataItem.filteredData[idx]
+		newFilteredRowIndices[i] = dataItem.filteredRowIndices[idx]
+	}
+
+	dataItem.filteredData = newFilteredData
+	dataItem.filteredRowIndices = newFilteredRowIndices
+}
+
+// applySortToData applies or removes sorting based on current state
+func (t *DataBrowser) applySortToData(dataItem *Data) {
+	if dataItem.sortedColumn < 0 || dataItem.sortDirection == 0 {
+		// No sorting or unsorted - data is already in filtered order
+		// (The applyFilters function sets up filteredData correctly)
+		return
+	}
+
+	// Apply sorting
+	ascending := (dataItem.sortDirection == 1)
+	t.sortData(dataItem, dataItem.sortedColumn, ascending)
+}
