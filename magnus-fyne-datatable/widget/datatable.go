@@ -152,8 +152,8 @@ func (dt *DataTable) buildTable(config Config) {
 	dt.table.CreateHeader = func() fyne.CanvasObject {
 		// Create a button that can be used for both row numbers and column headers
 		btn := widget.NewButton("", nil)
-		btn.Importance = widget.LowImportance
-		btn.Resize(fyne.NewSize(50, 30))
+		btn.Importance = widget.MediumImportance // Medium importance for better centered text
+		// Size will be set by UpdateHeader and AutoAdjustColumns
 		return btn
 	}
 	dt.table.UpdateHeader = func(id widget.TableCellID, cell fyne.CanvasObject) {
@@ -210,14 +210,9 @@ func (dt *DataTable) buildTable(config Config) {
 		// Handle column headers
 		btn := cell.(*widget.Button)
 
-		// Ensure proper sizing is maintained
-		if config.SelectionMode == SelectionModeRow {
-			btn.Importance = widget.MediumImportance
-			btn.Resize(fyne.NewSize(120, 35)) // Much larger size for row numbers
-		} else {
-			btn.Importance = widget.LowImportance
-			btn.Resize(fyne.NewSize(50, 30))
-		}
+		// Use medium importance for better centered text appearance
+		btn.Importance = widget.MediumImportance
+		// Don't set fixed size here - let AutoAdjustColumns control width
 
 		colName, err := dt.model.VisibleColumnName(id.Col)
 		if err != nil {
@@ -313,12 +308,14 @@ func (dt *DataTable) AutoAdjustColumns() {
 		// Add extra space for sort indicator (which could appear)
 		headerText := colName + " ↓" // Account for widest indicator
 
-		// Measure the text width
+		// Use medium importance button for accurate measurement
+		tempButton.Importance = widget.MediumImportance
 		tempButton.SetText(headerText)
 		minSize := tempButton.MinSize()
 
-		// Add padding (buttons have internal padding, but add a bit extra)
-		width := minSize.Width + 20 // Extra padding for comfort
+		// Add generous padding for comfortable display and center alignment
+		// Buttons need extra space on both sides for centered text to look good
+		width := minSize.Width + 40 // Increased padding for better centering
 
 		// Apply minimum width if configured
 		if dt.config.MinColumnWidth > 0 && width < float32(dt.config.MinColumnWidth) {
@@ -335,7 +332,7 @@ func (dt *DataTable) AutoAdjustColumns() {
 
 // buildLayout creates the layout with optional filter bar, column selector, and status bar.
 func (dt *DataTable) buildLayout() {
-	var top, bottom, right fyne.CanvasObject
+	var top, bottom fyne.CanvasObject
 
 	// Build top section with FilterBar and ColumnSelector if enabled
 	topComponents := make([]fyne.CanvasObject, 0)
@@ -354,13 +351,14 @@ func (dt *DataTable) buildLayout() {
 		top = container.NewVBox(topComponents...)
 	}
 
-	// Create StatusBar if enabled
+	// Create bottom section with StatusBar and Settings button if enabled
+	bottomComponents := make([]fyne.CanvasObject, 0)
+
 	if dt.config.ShowStatusBar {
 		dt.statusBar = NewStatusBar(dt)
-		bottom = dt.statusBar
+		bottomComponents = append(bottomComponents, dt.statusBar)
 	}
 
-	// Create settings button if enabled
 	if dt.config.ShowSettingsButton {
 		dt.settingsButton = widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
 			if dt.window != nil {
@@ -369,15 +367,15 @@ func (dt *DataTable) buildLayout() {
 			}
 		})
 		dt.settingsButton.Importance = widget.LowImportance
-
-		// Place settings button in top-right corner
-		right = container.NewVBox(
-			dt.settingsButton,
-		)
+		bottomComponents = append(bottomComponents, dt.settingsButton)
 	}
 
-	// Build container with border layout
-	dt.container = container.NewBorder(top, bottom, nil, right, dt.table)
+	if len(bottomComponents) > 0 {
+		bottom = container.NewBorder(nil, nil, nil, dt.settingsButton, dt.statusBar)
+	}
+
+	// Build container with border layout (no right component now)
+	dt.container = container.NewBorder(top, bottom, nil, nil, dt.table)
 }
 
 // SetWindow sets the window reference for the DataTable.
