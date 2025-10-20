@@ -1,0 +1,9 @@
+[Details]
+Icon = "Icon.png"
+Name = "dsb"
+ID = "dsb.arm"
+Version = "1.1.0"
+Build = 3
+
+[Migrations]
+fyneDo = true
