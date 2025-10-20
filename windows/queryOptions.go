@@ -1,9 +1,11 @@
 package windows
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -11,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 	"github.com/apache/arrow-go/v18/arrow"
+	delta_sharing "github.com/magpierre/go_delta_sharing_client"
 )
 
 // QueryOptions holds the query configuration for table data loading
@@ -94,6 +97,7 @@ func (qod *QueryOptionsDialog) createDialog() {
 	limitLabel.TextStyle = fyne.TextStyle{Bold: true}
 
 	qod.limitEntry = widget.NewEntry()
+	qod.limitEntry.SetText("1000") // Default to 1000 rows
 	qod.limitEntry.SetPlaceHolder("Leave empty for all rows, or enter a number (e.g., 1000)")
 
 	limitHelp := widget.NewLabel("Maximum number of rows to return. Leave empty to return all rows.")
@@ -282,4 +286,69 @@ func NewListWithContextMenu(data binding.StringList, onSelected func(widget.List
 	}
 
 	return list
+}
+
+// ShowQueryOptionsDialogWithSchema loads table schema and shows enhanced query options dialog
+func ShowQueryOptionsDialogWithSchema(w fyne.Window, profile string, table delta_sharing.Table, callback func(*QueryOptions)) {
+	// Create and show progress dialog on calling thread (which should be main/UI thread)
+	progressBar := widget.NewProgressBarInfinite()
+	progressBar.Start()
+
+	progressDialog := dialog.NewCustomWithoutButtons("Loading Schema", progressBar, w)
+	progressDialog.Resize(fyne.NewSize(300, 100))
+	progressDialog.Show()
+
+	// Launch single background goroutine to load schema
+	go func() {
+		// Perform schema loading (network I/O, no UI operations)
+		ds, err := delta_sharing.NewSharingClientFromString(profile)
+		if err != nil {
+			progressBar.Stop()
+			progressDialog.Hide()
+			time.Sleep(50 * time.Millisecond)
+			dialog.ShowError(fmt.Errorf("failed to create client: %w", err), w)
+			return
+		}
+
+		resp, err := ds.ListFilesInTable(context.Background(), table)
+		if err != nil {
+			progressBar.Stop()
+			progressDialog.Hide()
+			time.Sleep(50 * time.Millisecond)
+			dialog.ShowError(fmt.Errorf("failed to list files: %w", err), w)
+			return
+		}
+
+		if len(resp.AddFiles) == 0 {
+			progressBar.Stop()
+			progressDialog.Hide()
+			time.Sleep(50 * time.Millisecond)
+			dialog.ShowError(fmt.Errorf("no files available for table"), w)
+			return
+		}
+
+		fileID := resp.AddFiles[0].Id
+		arrowTable, err := delta_sharing.LoadArrowTable(context.Background(), ds, table, fileID)
+		if err != nil {
+			progressBar.Stop()
+			progressDialog.Hide()
+			time.Sleep(50 * time.Millisecond)
+			dialog.ShowError(fmt.Errorf("failed to load schema: %w", err), w)
+			return
+		}
+
+		schema := arrowTable.Schema()
+		arrowTable.Release()
+
+		// Close progress dialog
+		progressBar.Stop()
+		progressDialog.Hide()
+
+		// Brief delay to allow dialog to fully close
+		time.Sleep(100 * time.Millisecond)
+
+		// Create and show query options dialog
+		qod := NewQueryOptionsDialog(w, schema, callback)
+		qod.Show()
+	}()
 }

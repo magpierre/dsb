@@ -88,7 +88,7 @@ func (nt *NavigationTree) ParseNodeID(nodeID string) (nodeType TreeNodeType, sha
 	return
 }
 
-// LoadShares populates the tree with root-level share nodes
+// LoadShares populates the tree with root-level share nodes and preloads all tables
 func (nt *NavigationTree) LoadShares(profile string) error {
 	nt.mu.Lock()
 	defer nt.mu.Unlock()
@@ -113,6 +113,7 @@ func (nt *NavigationTree) LoadShares(profile string) error {
 	nt.rootIDs = make([]string, 0, len(shares))
 
 	// Create share nodes
+	shareMap := make(map[string]*TreeNode)
 	for _, share := range shares {
 		nodeID := nt.GenerateNodeID(NodeTypeShare, share.Name, "", "")
 		node := &TreeNode{
@@ -120,11 +121,81 @@ func (nt *NavigationTree) LoadShares(profile string) error {
 			NodeType:       NodeTypeShare,
 			Name:           share.Name,
 			Share:          share.Name,
-			Children:       nil, // Will be lazy-loaded
-			ChildrenLoaded: false,
+			Children:       make([]string, 0),
+			ChildrenLoaded: true, // Will be populated below
 		}
 		nt.nodes[nodeID] = node
 		nt.rootIDs = append(nt.rootIDs, nodeID)
+		shareMap[share.Name] = node
+	}
+
+	// Preload all tables using ListAllTables
+	allTables, _, err := client.ListAllTables(context.Background(), 0, "")
+	if err != nil {
+		return fmt.Errorf("failed to list all tables: %w", err)
+	}
+
+	// Map to track schema nodes by their ID
+	schemaMap := make(map[string]*TreeNode)
+
+	// Create schema and table nodes from the preloaded data
+	for _, table := range allTables {
+		shareName := table.Share
+		schemaName := table.Schema
+		tableName := table.Name
+
+		// Get or create share node (should already exist)
+		shareNode, shareExists := shareMap[shareName]
+		if !shareExists {
+			// If share doesn't exist, create it
+			shareNodeID := nt.GenerateNodeID(NodeTypeShare, shareName, "", "")
+			shareNode = &TreeNode{
+				ID:             shareNodeID,
+				NodeType:       NodeTypeShare,
+				Name:           shareName,
+				Share:          shareName,
+				Children:       make([]string, 0),
+				ChildrenLoaded: true,
+			}
+			nt.nodes[shareNodeID] = shareNode
+			nt.rootIDs = append(nt.rootIDs, shareNodeID)
+			shareMap[shareName] = shareNode
+		}
+
+		// Get or create schema node
+		schemaNodeID := nt.GenerateNodeID(NodeTypeSchema, shareName, schemaName, "")
+		schemaNode, schemaExists := schemaMap[schemaNodeID]
+		if !schemaExists {
+			schemaNode = &TreeNode{
+				ID:             schemaNodeID,
+				NodeType:       NodeTypeSchema,
+				Name:           schemaName,
+				Share:          shareName,
+				Schema:         schemaName,
+				Children:       make([]string, 0),
+				ChildrenLoaded: true,
+			}
+			nt.nodes[schemaNodeID] = schemaNode
+			schemaMap[schemaNodeID] = schemaNode
+			// Add schema to share's children
+			shareNode.Children = append(shareNode.Children, schemaNodeID)
+		}
+
+		// Create table node
+		tableNodeID := nt.GenerateNodeID(NodeTypeTable, shareName, schemaName, tableName)
+		tableNode := &TreeNode{
+			ID:             tableNodeID,
+			NodeType:       NodeTypeTable,
+			Name:           tableName,
+			Share:          shareName,
+			Schema:         schemaName,
+			Table:          table,
+			Children:       nil,
+			ChildrenLoaded: true, // Tables don't have children
+		}
+		nt.nodes[tableNodeID] = tableNode
+		// Add table to schema's children
+		schemaNode.Children = append(schemaNode.Children, tableNodeID)
 	}
 
 	return nil
@@ -177,39 +248,24 @@ func (nt *NavigationTree) GetNode(nodeID widget.TreeNodeID) *TreeNode {
 	return nt.nodes[nodeID]
 }
 
-// LazyLoadChildren fetches and loads children for a node if not already loaded
+// LazyLoadChildren is no longer needed since all data is preloaded
+// This method is kept for compatibility but will always return early
 func (nt *NavigationTree) LazyLoadChildren(nodeID widget.TreeNodeID) error {
-	nt.mu.Lock()
-	defer nt.mu.Unlock()
+	nt.mu.RLock()
+	defer nt.mu.RUnlock()
 
 	node, exists := nt.nodes[nodeID]
 	if !exists {
 		return fmt.Errorf("node not found: %s", nodeID)
 	}
 
-	// Already loaded
+	// All children are preloaded, so this should always be true
 	if node.ChildrenLoaded {
 		return nil
 	}
 
-	if nt.client == nil {
-		return fmt.Errorf("Delta Sharing client not initialized")
-	}
-
-	switch node.NodeType {
-	case NodeTypeShare:
-		// Load schemas for this share
-		return nt.loadSchemas(node)
-
-	case NodeTypeSchema:
-		// Load tables for this schema
-		return nt.loadTables(node)
-
-	default:
-		// Tables don't have children
-		node.ChildrenLoaded = true
-		return nil
-	}
+	// This shouldn't happen with preloading, but handle gracefully
+	return nil
 }
 
 // loadSchemas fetches schemas for a share node

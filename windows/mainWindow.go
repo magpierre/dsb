@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"time"
 
 	"dsb/windows/resources"
 
@@ -299,25 +298,7 @@ func (t *MainWindow) NewMainWindow() {
 		t.handleTreeSelection(uid)
 	}
 
-	// Handle branch expansion - lazy load children
-	t.treeWidget.OnBranchOpened = func(uid widget.TreeNodeID) {
-		node := t.navTree.GetNode(uid)
-		if node != nil && !node.ChildrenLoaded {
-			// Lazy load children in background
-			go func() {
-				t.SetStatus("Loading...")
-				err := t.navTree.LazyLoadChildren(uid)
-				if err != nil {
-					t.SetStatus(fmt.Sprintf("Error loading: %v", err))
-					dialog.ShowError(err, t.w)
-					return
-				}
-				// Refresh tree to show new children
-				t.treeWidget.Refresh()
-				t.SetStatus("Ready")
-			}()
-		}
-	}
+	// No need for OnBranchOpened handler - all data is preloaded
 
 	// Set up navigation panel with tree - use scroll container
 	treeScroll := container.NewScroll(t.treeWidget)
@@ -381,24 +362,6 @@ func (t *MainWindow) NewMainWindow() {
 
 	c := container.NewBorder(t.top, t.bottom, t.left, t.right, widget.NewCard("", "", tabs))
 	t.w.SetContent(c)
-
-	// Add a resize callback to position the export button correctly when window resizes
-	t.w.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
-		// This is a workaround to trigger position updates
-	})
-
-	// Monitor canvas size changes to reposition export button
-	go func() {
-		var lastSize fyne.Size
-		for {
-			time.Sleep(100 * time.Millisecond)
-			currentSize := t.w.Canvas().Size()
-			if currentSize.Width != lastSize.Width || currentSize.Height != lastSize.Height {
-				lastSize = currentSize
-				t.updateExportButton()
-			}
-		}
-	}()
 
 	t.w.SetOnClosed(func() {
 		// Cleanup if needed
@@ -552,10 +515,10 @@ func (t *MainWindow) handleTreeSelection(nodeID widget.TreeNodeID) {
 		t.selected.schema = node.Schema
 		t.selected.table_name = node.Name
 		t.selected.table = node.Table
-		t.SetStatus("Loading table data: " + node.Name)
+		t.SetStatus("Loading table data (first 1000 rows): " + node.Name)
 
-		// Load table data
-		t.loadTableData(node.Table, nil)
+		// Load table data with default 1000 row limit
+		t.loadTableData(node.Table, &QueryOptions{Limit: 1000})
 	}
 }
 
@@ -578,8 +541,8 @@ func (t *MainWindow) handleTreeRightClick(nodeID widget.TreeNodeID, e *fyne.Poin
 				t.treeWidget.Select(nodeID)
 			}),
 			fyne.NewMenuItem("Open with Query Options...", func() {
-				// Show query options dialog
-				SimpleQueryOptionsDialog(t.w, func(options *QueryOptions) {
+				// Show enhanced query options dialog with column checkboxes
+				ShowQueryOptionsDialogWithSchema(t.w, t.profile, node.Table, func(options *QueryOptions) {
 					// Update selected state
 					t.selected.share = node.Share
 					t.selected.schema = node.Schema
