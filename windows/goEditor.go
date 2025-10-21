@@ -32,19 +32,19 @@ import (
 
 // GoEditor manages the Go code editor and output pane
 type GoEditor struct {
-	w                fyne.Window
-	codeEditor       *widget.Entry
-	syntaxEditor     *SyntaxEditor
-	outputText       *widget.RichText
-	executeButton    *widget.Button
-	clearButton      *widget.Button
-	saveButton       *widget.Button
-	container        *fyne.Container
-	interpreter      *interp.Interpreter
-	editorScroll     *container.Scroll
-	previewScroll    *container.Scroll
-	stopScrollSync   chan bool
-	lastCursorRow    int // Track last cursor row for change detection
+	w              fyne.Window
+	codeEditor     *widget.Entry
+	syntaxEditor   *SyntaxEditor
+	outputText     *widget.RichText
+	executeButton  *widget.Button
+	clearButton    *widget.Button
+	saveButton     *widget.Button
+	container      *fyne.Container
+	interpreter    *interp.Interpreter
+	editorScroll   *container.Scroll
+	previewScroll  *container.Scroll
+	stopScrollSync chan bool
+	lastCursorRow  int // Track last cursor row for change detection
 
 	// Debouncing for syntax highlighting
 	syntaxUpdateChan chan string
@@ -52,7 +52,7 @@ type GoEditor struct {
 	lastText         string // Track last processed text for incremental updates
 
 	// Async code execution
-	executionDone    chan bool
+	executionDone chan bool
 }
 
 // NewGoEditor creates a new Go editor instance
@@ -60,7 +60,7 @@ func NewGoEditor(w fyne.Window) *GoEditor {
 	ge := &GoEditor{
 		w:                w,
 		stopScrollSync:   make(chan bool),
-		syntaxUpdateChan: make(chan string, 10),    // Buffered channel for text updates
+		syntaxUpdateChan: make(chan string, 10), // Buffered channel for text updates
 		stopSyntaxUpdate: make(chan bool),
 		executionDone:    make(chan bool),
 	}

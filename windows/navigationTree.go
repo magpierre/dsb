@@ -37,24 +37,24 @@ const (
 
 // TreeNode represents a node in the navigation tree
 type TreeNode struct {
-	ID           string              // Unique identifier
-	NodeType     TreeNodeType        // Type of node
-	Name         string              // Display name
-	Share        string              // Parent share name
-	Schema       string              // Parent schema name (for tables)
-	Table        delta_sharing.Table // Full table object (for table nodes)
-	Children     []string            // Child node IDs
-	ChildrenLoaded bool              // Whether children have been loaded from server
+	ID             string              // Unique identifier
+	NodeType       TreeNodeType        // Type of node
+	Name           string              // Display name
+	Share          string              // Parent share name
+	Schema         string              // Parent schema name (for tables)
+	Table          delta_sharing.Table // Full table object (for table nodes)
+	Children       []string            // Child node IDs
+	ChildrenLoaded bool                // Whether children have been loaded from server
 }
 
 // NavigationTree manages the hierarchical tree structure for Delta Sharing navigation
 type NavigationTree struct {
-	nodes       map[string]*TreeNode
-	rootIDs     []string
-	profile     string
-	client      delta_sharing.SharingClient
-	mainWin     *MainWindow
-	mu          sync.RWMutex // Protect concurrent access during lazy loading
+	nodes   map[string]*TreeNode
+	rootIDs []string
+	profile string
+	client  delta_sharing.SharingClient
+	mainWin *MainWindow
+	mu      sync.RWMutex // Protect concurrent access during lazy loading
 }
 
 // NewNavigationTree creates and initializes a new navigation tree

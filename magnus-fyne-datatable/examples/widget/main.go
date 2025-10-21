@@ -61,11 +61,11 @@ func main() {
 
 	// Create DataTable widget with all features enabled
 	config := dtwidget.DefaultConfig()
-	config.ShowColumnSelector = true     // Enable column selection accordion
-	config.ShowFilterBar = true          // Enable row filtering (already default)
-	config.ShowStatusBar = true          // Enable status bar (already default)
-	config.ShowSettingsButton = true     // Enable settings button (already default)
-	config.AutoAdjustColumnWidths = true // Auto-adjust columns to fit headers
+	config.ShowColumnSelector = true                 // Enable column selection accordion
+	config.ShowFilterBar = true                      // Enable row filtering (already default)
+	config.ShowStatusBar = true                      // Enable status bar (already default)
+	config.ShowSettingsButton = true                 // Enable settings button (already default)
+	config.AutoAdjustColumnWidths = true             // Auto-adjust columns to fit headers
 	config.SelectionMode = dtwidget.SelectionModeRow // Enable row selection for copy functionality
 	table := dtwidget.NewDataTableWithConfig(model, config)
 

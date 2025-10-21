@@ -25,10 +25,10 @@ import (
 type ThemeType string
 
 const (
-	ThemeTypeCustom       ThemeType = "custom"
-	ThemeTypeShadcnSlate  ThemeType = "shadcn-slate"
-	ThemeTypeShadcnStone  ThemeType = "shadcn-stone"
-	ThemeTypeDefault      ThemeType = "default"
+	ThemeTypeCustom      ThemeType = "custom"
+	ThemeTypeShadcnSlate ThemeType = "shadcn-slate"
+	ThemeTypeShadcnStone ThemeType = "shadcn-stone"
+	ThemeTypeDefault     ThemeType = "default"
 )
 
 // CustomTheme defines a modern theme for the Delta Sharing Browser

@@ -156,7 +156,7 @@ func main() {
 	}
 
 	multiSortSpecs := []sort.SortSpec{
-		{Column: 1, Direction: datatable.SortAscending, DataType: datatable.TypeInt},  // Age
+		{Column: 1, Direction: datatable.SortAscending, DataType: datatable.TypeInt},     // Age
 		{Column: 0, Direction: datatable.SortDescending, DataType: datatable.TypeString}, // Name
 	}
 

@@ -29,10 +29,10 @@ type StatusBar struct {
 	dataTable *DataTable
 
 	// UI components
-	rowCountLabel    *widget.Label
-	filterLabel      *widget.Label
-	sortLabel        *widget.Label
-	container        *fyne.Container
+	rowCountLabel *widget.Label
+	filterLabel   *widget.Label
+	sortLabel     *widget.Label
+	container     *fyne.Container
 }
 
 // NewStatusBar creates a new status bar for the given DataTable.

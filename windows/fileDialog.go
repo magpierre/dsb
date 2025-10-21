@@ -182,8 +182,8 @@ func (pd *ProfileDialog) Show() {
 			if err == nil && fileInfo.IsDir() {
 				icon.SetResource(theme.FolderIcon())
 			} else if strings.HasSuffix(fileName, ".share") || strings.HasSuffix(fileName, ".json") ||
-			          strings.HasSuffix(fileName, ".txt") || strings.HasSuffix(fileName, ".csv") ||
-			          strings.HasSuffix(fileName, ".parquet") {
+				strings.HasSuffix(fileName, ".txt") || strings.HasSuffix(fileName, ".csv") ||
+				strings.HasSuffix(fileName, ".parquet") {
 				icon.SetResource(theme.DocumentIcon())
 			} else {
 				icon.SetResource(theme.FileIcon())
@@ -317,8 +317,8 @@ func (pd *ProfileDialog) loadDirectory() {
 		if !entry.IsDir() {
 			name := entry.Name()
 			if strings.HasSuffix(name, ".share") || strings.HasSuffix(name, ".json") ||
-			   strings.HasSuffix(name, ".txt") || strings.HasSuffix(name, ".csv") ||
-			   strings.HasSuffix(name, ".parquet") {
+				strings.HasSuffix(name, ".txt") || strings.HasSuffix(name, ".csv") ||
+				strings.HasSuffix(name, ".parquet") {
 				pd.files = append(pd.files, name)
 			}
 		}
