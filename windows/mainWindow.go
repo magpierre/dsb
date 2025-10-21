@@ -5,16 +5,14 @@ import (
 	"fmt"
 	"io"
 
-	"dsb/windows/resources"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
 	delta_sharing "github.com/magpierre/go_delta_sharing_client"
 )
 
@@ -122,12 +120,15 @@ type MainWindow struct {
 	selected                 Selected
 	docTabs                  *container.DocTabs
 	dataBrowser              *DataBrowser
+	goEditor                 *GoEditor
 	statusBar                *widget.Label
 	exportButton             *widget.Button
 	toolbar                  *widget.Toolbar
 	themeManager             *ThemeManager
 	navTree                  *NavigationTree
 	treeWidget               *widget.Tree
+	// Go Editor toolbar buttons container
+	goEditorButtonsContainer *fyne.Container
 }
 
 func CreateMainWindow() *MainWindow {
@@ -136,20 +137,20 @@ func CreateMainWindow() *MainWindow {
 	return &v
 }
 
-func (t *MainWindow) OpenProfile() {
-	pd := NewProfileDialog(t.w, t.a, func(content string, err error) {
+func (t *MainWindow) OpenFile() {
+	d := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
+		if err != nil || uc == nil {
+			return
+		}
+
+		content, err := io.ReadAll(uc)
 		if err != nil {
-			t.SetStatus("Error opening profile")
 			dialog.ShowError(err, t.w)
 			return
 		}
 
-		if content == "" {
-			return
-		}
-
+		t.profile = string(content)
 		t.SetStatus("Loading profile...")
-		t.profile = content
 
 		// Initialize navigation tree with shares
 		err = t.navTree.LoadShares(t.profile)
@@ -169,6 +170,62 @@ func (t *MainWindow) OpenProfile() {
 
 		t.w.Content().Refresh()
 		t.SetStatus("Profile loaded successfully")
+	}, t.w)
+	d.Show()
+}
+
+func (t *MainWindow) OpenProfile() {
+	var pd *ProfileDialog
+	pd = NewProfileDialog(t.w, t.a, func(content string, err error) {
+		if err != nil {
+			t.SetStatus("Error opening file")
+			dialog.ShowError(err, t.w)
+			return
+		}
+
+		if content == "" {
+			return
+		}
+
+		// Get file path from dialog
+		filePath := pd.filePath
+
+		// Detect file type
+		fileType := DetectFileType(filePath, content)
+
+		switch fileType {
+		case FileTypeCSV, FileTypeParquet, FileTypeJSON:
+			// Handle data files
+			t.handleDataFileLoad(filePath)
+
+		case FileTypeDeltaSharingProfile:
+			// Handle Delta Sharing profile
+			t.SetStatus("Loading profile...")
+			t.profile = content
+
+			// Initialize navigation tree with shares
+			err = t.navTree.LoadShares(t.profile)
+			if err != nil {
+				t.SetStatus("Error loading shares")
+				dialog.ShowError(err, t.w)
+				return
+			}
+
+			t.files = make([]string, 0)
+			t.selected = Selected{}
+
+			// Refresh tree widget to show shares
+			if t.treeWidget != nil {
+				t.treeWidget.Refresh()
+			}
+
+			t.w.Content().Refresh()
+			t.SetStatus("Profile loaded successfully")
+
+		default:
+			t.SetStatus("Unknown file type")
+			dialog.ShowError(fmt.Errorf("unsupported file type"), t.w)
+		}
 	})
 	pd.Show()
 }
@@ -245,9 +302,6 @@ func (t *MainWindow) NewMainWindow() {
 			t.SetStatus("Profile loaded successfully")
 		}
 	})
-
-	logo := canvas.NewImageFromResource(resources.ResourceDeltasharingPng)
-	logo.FillMode = canvas.ImageFillContain
 
 	// Create tree widget for navigation
 	t.treeWidget = widget.NewTree(
@@ -333,11 +387,61 @@ func (t *MainWindow) NewMainWindow() {
 		}))
 	t.toolbar.Append(widget.NewToolbarSeparator())
 	t.toolbar.Append(widget.NewToolbarAction(
+		theme.ComputerIcon(), func() {
+			t.showGoEditor()
+		}))
+	t.toolbar.Append(widget.NewToolbarSeparator())
+	t.toolbar.Append(widget.NewToolbarAction(
 		theme.ColorPaletteIcon(), func() {
 			t.showThemeSelector()
 		}))
 
 	t.toolbar.Append(widget.NewToolbarSpacer())
+
+	// Create Go Editor buttons container (separate from toolbar)
+	executeBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {
+		if t.goEditor != nil {
+			t.goEditor.executeCode()
+		}
+	})
+	executeBtn.Importance = widget.HighImportance
+
+	clearOutputBtn := widget.NewButtonWithIcon("", theme.ContentClearIcon(), func() {
+		if t.goEditor != nil {
+			t.goEditor.clearOutput()
+		}
+	})
+
+	clearEditorBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+		if t.goEditor != nil {
+			t.goEditor.codeEditor.SetText("")
+		}
+	})
+
+	saveBtn := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
+		if t.goEditor != nil {
+			t.goEditor.saveCode()
+		}
+	})
+
+	loadBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
+		if t.goEditor != nil {
+			t.goEditor.loadCode()
+		}
+	})
+
+	separator := widget.NewSeparator()
+
+	t.goEditorButtonsContainer = container.NewHBox(
+		separator,
+		widget.NewLabel(" "), // Small spacer
+		executeBtn,
+		clearOutputBtn,
+		clearEditorBtn,
+		saveBtn,
+		loadBtn,
+	)
+	t.goEditorButtonsContainer.Hide()
 
 	// Create export button (initially hidden)
 	t.exportButton = widget.NewButtonWithIcon("Export", theme.DocumentSaveIcon(), func() {
@@ -345,19 +449,20 @@ func (t *MainWindow) NewMainWindow() {
 	})
 	t.exportButton.Hide()
 
-	llo := container.NewWithoutLayout(logo)
-	logo.Resize(fyne.NewSize(200, 50))
-	logo.Move(fyne.NewPos(160, -10))
-
 	// Create a container for the export button positioned on the right
 	exportContainer := container.NewWithoutLayout(t.exportButton)
 	t.exportButton.Resize(fyne.NewSize(100, 36))
 
-	t.top = container.NewStack(t.toolbar, llo, exportContainer)
+	// Create a container that includes toolbar and Go Editor buttons
+	toolbarRow := container.NewBorder(nil, nil, nil, nil,
+		container.NewHBox(t.toolbar, t.goEditorButtonsContainer))
 
-	// Set up tab change callback to show/hide export button
+	t.top = container.NewStack(toolbarRow, exportContainer)
+
+	// Set up tab change callback to show/hide export button and Go Editor buttons
 	tabs.OnSelected = func(ti *container.TabItem) {
 		t.updateExportButton()
+		t.updateGoEditorButtons()
 	}
 
 	c := container.NewBorder(t.top, t.bottom, t.left, t.right, widget.NewCard("", "", tabs))
@@ -384,6 +489,29 @@ func (t *MainWindow) updateExportButton() {
 		t.exportButton.Hide()
 	}
 	t.exportButton.Refresh()
+}
+
+// updateGoEditorButtons shows or hides Go Editor buttons based on the current tab
+func (t *MainWindow) updateGoEditorButtons() {
+	if t.docTabs.Selected() != nil && t.docTabs.Selected().Text == "Go Editor" {
+		t.showGoEditorButtons()
+	} else {
+		t.hideGoEditorButtons()
+	}
+}
+
+// showGoEditorButtons shows the Go Editor buttons container
+func (t *MainWindow) showGoEditorButtons() {
+	if t.goEditorButtonsContainer != nil {
+		t.goEditorButtonsContainer.Show()
+	}
+}
+
+// hideGoEditorButtons hides the Go Editor buttons container
+func (t *MainWindow) hideGoEditorButtons() {
+	if t.goEditorButtonsContainer != nil {
+		t.goEditorButtonsContainer.Hide()
+	}
 }
 
 // showThemeSelector displays a dialog for selecting the application theme
@@ -488,6 +616,41 @@ func (t *MainWindow) showExportMenu() {
 
 	// Show the menu at the export button position
 	widget.ShowPopUpMenuAtPosition(exportMenu, t.w.Canvas(), fyne.CurrentApp().Driver().AbsolutePositionForObject(t.exportButton))
+}
+
+// showGoEditor shows or creates the Go editor tab
+func (t *MainWindow) showGoEditor() {
+	// Check if Go tab already exists
+	for _, tab := range t.docTabs.Items {
+		if tab.Text == "Go Editor" {
+			// Tab exists, just select it
+			t.docTabs.Select(tab)
+			// Explicitly update Go Editor buttons to ensure they are shown
+			t.updateGoEditorButtons()
+			t.SetStatus("Go editor opened")
+			return
+		}
+	}
+
+	// Create new Go editor if it doesn't exist
+	if t.goEditor == nil {
+		t.goEditor = NewGoEditor(t.w)
+	}
+
+	// Create and add the Go tab
+	goTab := container.NewTabItem("Go Editor", t.goEditor.GetContainer())
+	t.docTabs.Append(goTab)
+	t.docTabs.Select(goTab)
+
+	// Explicitly update Go Editor buttons to ensure they are shown
+	t.updateGoEditorButtons()
+
+	// Hide navigation menu when Go editor is opened
+	if t.left.Visible() {
+		t.left.Hide()
+	}
+
+	t.SetStatus("Go editor opened")
 }
 
 // handleTreeSelection handles selection of a node in the navigation tree

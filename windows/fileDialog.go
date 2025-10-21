@@ -25,6 +25,7 @@ type ProfileDialog struct {
 	currentPath    string
 	pathLabel      *widget.Label
 	app            fyne.App
+	filePath       string // Store the selected file path
 }
 
 const maxRecentProfiles = 5
@@ -36,6 +37,7 @@ func NewProfileDialog(w fyne.Window, a fyne.App, callback func(string, error)) *
 		app:      a,
 		callback: callback,
 		files:    make([]string, 0),
+		filePath: "",
 	}
 
 	// Get home directory
@@ -136,6 +138,9 @@ func (pd *ProfileDialog) Show() {
 		// Update recent profiles (move to front)
 		pd.addRecentProfile(profilePath)
 
+		// Store file path for external access
+		pd.filePath = profilePath
+
 		pd.callback(string(content), nil)
 		pd.dialog.Hide()
 	}
@@ -162,7 +167,9 @@ func (pd *ProfileDialog) Show() {
 			fileInfo, err := os.Stat(fullPath)
 			if err == nil && fileInfo.IsDir() {
 				icon.SetResource(theme.FolderIcon())
-			} else if strings.HasSuffix(fileName, ".share") || strings.HasSuffix(fileName, ".json") || strings.HasSuffix(fileName, ".txt") {
+			} else if strings.HasSuffix(fileName, ".share") || strings.HasSuffix(fileName, ".json") ||
+			          strings.HasSuffix(fileName, ".txt") || strings.HasSuffix(fileName, ".csv") ||
+			          strings.HasSuffix(fileName, ".parquet") {
 				icon.SetResource(theme.DocumentIcon())
 			} else {
 				icon.SetResource(theme.FileIcon())
@@ -197,6 +204,9 @@ func (pd *ProfileDialog) Show() {
 			// Add to recent profiles
 			pd.addRecentProfile(fullPath)
 
+			// Store file path for external access
+			pd.filePath = fullPath
+
 			pd.callback(string(content), nil)
 			pd.dialog.Hide()
 		}
@@ -221,7 +231,7 @@ func (pd *ProfileDialog) Show() {
 	})
 
 	// Create filter info
-	filterInfo := widget.NewLabel("Showing: .share, .json, and .txt files, and directories")
+	filterInfo := widget.NewLabel("Showing: .share, .json, .txt, .csv, and .parquet files, and directories")
 	filterInfo.TextStyle = fyne.TextStyle{Italic: true}
 
 	// Navigation toolbar
@@ -233,7 +243,7 @@ func (pd *ProfileDialog) Show() {
 	)
 
 	// Instructions
-	instructions := widget.NewRichTextFromMarkdown("**Select a Delta Sharing profile file (.share, .json, or .txt)**\n\nDouble-click a folder to navigate, or click a file to select it.")
+	instructions := widget.NewRichTextFromMarkdown("**Select a Delta Sharing profile or data file**\n\nSupported formats:\n- Delta Sharing profiles: .share, .json, .txt\n- Data files: .csv, .parquet, .json\n\nDouble-click a folder to navigate, or click a file to select it.")
 	instructions.Wrapping = fyne.TextWrapWord
 
 	// Create recent profiles card - always use the list
@@ -288,11 +298,13 @@ func (pd *ProfileDialog) loadDirectory() {
 		}
 	}
 
-	// Add .share, .json, and .txt files
+	// Add .share, .json, .txt, .csv, and .parquet files
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			name := entry.Name()
-			if strings.HasSuffix(name, ".share") || strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".txt") {
+			if strings.HasSuffix(name, ".share") || strings.HasSuffix(name, ".json") ||
+			   strings.HasSuffix(name, ".txt") || strings.HasSuffix(name, ".csv") ||
+			   strings.HasSuffix(name, ".parquet") {
 				pd.files = append(pd.files, name)
 			}
 		}

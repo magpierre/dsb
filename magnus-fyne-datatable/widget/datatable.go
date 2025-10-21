@@ -136,15 +136,16 @@ func (dt *DataTable) buildTable(config Config) {
 	)
 
 	// Configure selection mode
-	if config.SelectionMode == SelectionModeRow {
-		// Row selection mode - select entire row
-		dt.table.ShowHeaderColumn = true // Shows row numbers
+	// Always show row numbers for better data navigation
+	dt.table.ShowHeaderColumn = true
 
+	if config.SelectionMode == SelectionModeRow {
+		// Row selection mode - select entire row with checkboxes
 		// Set minimum size for header column buttons to make them more visible
-		dt.table.SetColumnWidth(0, 120) // Make row number column much wider
+		dt.table.SetColumnWidth(0, 120) // Make row number column wider for checkboxes
 	} else {
-		// Cell selection mode (default) - select individual cells
-		dt.table.ShowHeaderColumn = false
+		// Cell selection mode (default) - show simple row numbers
+		dt.table.SetColumnWidth(0, 60) // Narrower column for simple row numbers
 	}
 
 	// Enable and configure column headers

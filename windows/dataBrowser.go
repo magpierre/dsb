@@ -247,8 +247,8 @@ func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id
 	c := make(chan bool)
 	go func(c chan bool) {
 		pbi := widget.NewProgressBarInfinite()
-		di := dialog.NewCustomWithoutButtons("Please wait", pbi, t.w)
-		di.Resize(fyne.NewSize(200, 100))
+		di := dialog.NewCustomWithoutButtons(fmt.Sprintf("Loading %s...", table.Name), pbi, t.w)
+		di.Resize(fyne.NewSize(300, 100))
 		di.Show()
 		pbi.Start()
 		for {
