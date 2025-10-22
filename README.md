@@ -267,7 +267,7 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ## Status
 
-This project is actively maintained. For issues, feature requests, or questions, please open an issue on GitHub.
+For issues, feature requests, or questions, please open an issue on GitHub.
 
 ---
 
