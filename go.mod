@@ -7,6 +7,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.4.1
 	github.com/magpierre/fyne-datatable v0.0.0
 	github.com/magpierre/go_delta_sharing_client v0.1.1
+	github.com/traefik/yaegi v0.16.1
 )
 
 replace github.com/magpierre/fyne-datatable => ./magnus-fyne-datatable
@@ -34,6 +35,7 @@ require (
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/flatbuffers v25.9.23+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/grundprinzip/unofficial-dbconnect-go v0.0.3 // indirect
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/jeandeaual/go-locale v0.0.0-20250612000132-0ef82f21eade // indirect
@@ -51,7 +53,6 @@ require (
 	github.com/srwiley/oksvg v0.0.0-20221011165216-be6e8873101c // indirect
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/traefik/yaegi v0.16.1 // indirect
 	github.com/yuin/goldmark v1.7.8 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
 	golang.org/x/exp v0.0.0-20251009144603-d2f985daa21b // indirect

@@ -16,7 +16,9 @@ package windows
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/theme"
@@ -30,7 +32,9 @@ type SyntaxEditor struct {
 	enabled         bool
 	onChange        func(string)
 	placeholder     string
-	maxLineNumWidth int // Width needed for line numbers
+	maxLineNumWidth int        // Width needed for line numbers
+	highlightedLine int        // Currently highlighted line (1-indexed, 0 = none)
+	mu              sync.Mutex // Protects textGrid from concurrent access
 }
 
 // NewSyntaxEditor creates a new syntax editor widget
@@ -40,8 +44,11 @@ func NewSyntaxEditor() *SyntaxEditor {
 		textGrid: widget.NewTextGrid(),
 	}
 
-	// Set initial empty content
-	se.textGrid.SetText("")
+	// Enable built-in line numbers on the TextGrid
+	se.textGrid.ShowLineNumbers = true
+
+	// Note: Don't call SetText("") on an empty TextGrid with ShowLineNumbers = true
+	// as it can cause an index out of bounds panic in Fyne v2.7.0
 
 	se.ExtendBaseWidget(se)
 
@@ -50,6 +57,9 @@ func NewSyntaxEditor() *SyntaxEditor {
 
 // SetText sets the text content and applies syntax highlighting
 func (se *SyntaxEditor) SetText(text string) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+
 	if !se.enabled {
 		se.textGrid.SetText(text)
 		return
@@ -67,16 +77,13 @@ func (se *SyntaxEditor) SetText(text string) {
 	// Build all rows first
 	rows := make([]widget.TextGridRow, len(lines))
 	for lineNum, line := range lines {
-		rows[lineNum] = se.createStyledRow(lineNum+1, line, se.maxLineNumWidth)
+		isHighlighted := (lineNum + 1) == se.highlightedLine
+		rows[lineNum] = se.createStyledRow(lineNum+1, line, se.maxLineNumWidth, isHighlighted)
 	}
 
 	// Update TextGrid with all rows
-	se.textGrid.SetText(text) // Set raw text first
-	for i, row := range rows {
-		if i < len(se.textGrid.Rows) {
-			se.textGrid.SetRow(i, row)
-		}
-	}
+	// Set the rows directly instead of calling SetText first to avoid cell duplication
+	se.textGrid.Rows = rows
 
 	se.textGrid.Refresh()
 
@@ -86,50 +93,45 @@ func (se *SyntaxEditor) SetText(text string) {
 	}
 }
 
-// createStyledRow parses a line and creates a styled TextGrid row with line number
-func (se *SyntaxEditor) createStyledRow(lineNum int, lineText string, maxLineNumWidth int) widget.TextGridRow {
+// createStyledRow parses a line and creates a styled TextGrid row without line number (TextGrid handles that)
+func (se *SyntaxEditor) createStyledRow(lineNum int, lineText string, maxLineNumWidth int, isHighlighted bool) widget.TextGridRow {
 	// Parse the line to get styled cells
 	cells := ParseGoLine(lineText)
 
-	// Format the line number with right padding
-	lineNumStr := fmt.Sprintf("%*d", maxLineNumWidth, lineNum)
-	separator := " │ "
-
-	// Calculate total prefix length (line number + separator)
-	prefixLen := len(lineNumStr) + len(separator)
-
-	// Create TextGrid row with prefix + cells
+	// Create TextGrid row with just the code cells (no manual line numbers)
 	row := widget.TextGridRow{
-		Cells: make([]widget.TextGridCell, prefixLen+len(cells)),
+		Cells: make([]widget.TextGridCell, len(cells)),
 	}
 
-	// Add line number cells (dimmed color)
-	lineNumStyle := &widget.CustomTextGridStyle{
-		FGColor: theme.DisabledColor(),
-	}
-	for i, ch := range lineNumStr {
-		row.Cells[i] = widget.TextGridCell{
-			Rune:  ch,
-			Style: lineNumStyle,
-		}
+	// Determine background color based on highlighting
+	var bgColor color.Color
+	if isHighlighted {
+		bgColor = theme.SelectionColor()
 	}
 
-	// Add separator cells
-	separatorStyle := &widget.CustomTextGridStyle{
-		FGColor: theme.DisabledColor(),
-	}
-	for i, ch := range separator {
-		row.Cells[len(lineNumStr)+i] = widget.TextGridCell{
-			Rune:  ch,
-			Style: separatorStyle,
-		}
-	}
-
-	// Add the styled code cells
+	// Add the styled code cells with highlighted background if needed
 	for col, styledCell := range cells {
-		row.Cells[prefixLen+col] = widget.TextGridCell{
+		// If highlighted, modify the style to include background color
+		style := styledCell.Style
+		if isHighlighted {
+			if customStyle, ok := style.(*widget.CustomTextGridStyle); ok {
+				// Create a new style with background color
+				highlightedStyle := &widget.CustomTextGridStyle{
+					FGColor: customStyle.FGColor,
+					BGColor: bgColor,
+				}
+				style = highlightedStyle
+			} else {
+				// Create new custom style with background
+				style = &widget.CustomTextGridStyle{
+					BGColor: bgColor,
+				}
+			}
+		}
+
+		row.Cells[col] = widget.TextGridCell{
 			Rune:  styledCell.Rune,
-			Style: styledCell.Style,
+			Style: style,
 		}
 	}
 
@@ -138,8 +140,12 @@ func (se *SyntaxEditor) createStyledRow(lineNum int, lineText string, maxLineNum
 
 // updateLine parses and styles a single line with line number
 func (se *SyntaxEditor) updateLine(lineNum int, lineText string) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+
 	// Create the styled row with line number (lineNum is 0-indexed, display as 1-indexed)
-	row := se.createStyledRow(lineNum+1, lineText, se.maxLineNumWidth)
+	isHighlighted := (lineNum + 1) == se.highlightedLine
+	row := se.createStyledRow(lineNum+1, lineText, se.maxLineNumWidth, isHighlighted)
 
 	// Set the row in TextGrid
 	if lineNum < len(se.textGrid.Rows) {
@@ -149,11 +155,15 @@ func (se *SyntaxEditor) updateLine(lineNum int, lineText string) {
 
 // GetText returns the current text content
 func (se *SyntaxEditor) GetText() string {
+	se.mu.Lock()
+	defer se.mu.Unlock()
 	return se.textGrid.Text()
 }
 
 // Text returns the current text content (alias for GetText for compatibility)
 func (se *SyntaxEditor) Text() string {
+	se.mu.Lock()
+	defer se.mu.Unlock()
 	return se.textGrid.Text()
 }
 
@@ -171,6 +181,9 @@ func (se *SyntaxEditor) SetOnChanged(callback func(string)) {
 
 // SetHighlightingEnabled enables or disables syntax highlighting
 func (se *SyntaxEditor) SetHighlightingEnabled(enabled bool) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+
 	se.enabled = enabled
 	if !enabled {
 		// Reload text without syntax highlighting
@@ -180,12 +193,17 @@ func (se *SyntaxEditor) SetHighlightingEnabled(enabled bool) {
 	} else {
 		// Re-apply syntax highlighting
 		text := se.textGrid.Text()
+		// Need to unlock before calling SetText to avoid deadlock
+		se.mu.Unlock()
 		se.SetText(text)
+		se.mu.Lock()
 	}
 }
 
 // GetTextGrid returns the underlying TextGrid widget
 func (se *SyntaxEditor) GetTextGrid() *widget.TextGrid {
+	se.mu.Lock()
+	defer se.mu.Unlock()
 	return se.textGrid
 }
 
@@ -197,17 +215,24 @@ func (se *SyntaxEditor) CreateRenderer() fyne.WidgetRenderer {
 
 // MinSize returns the minimum size of the widget
 func (se *SyntaxEditor) MinSize() fyne.Size {
+	se.mu.Lock()
+	defer se.mu.Unlock()
 	return se.textGrid.MinSize()
 }
 
 // Resize sets the size of the widget
 func (se *SyntaxEditor) Resize(size fyne.Size) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
 	se.BaseWidget.Resize(size)
 	se.textGrid.Resize(size)
 }
 
 // UpdateLineRange updates only a range of lines (for better performance)
 func (se *SyntaxEditor) UpdateLineRange(startLine, endLine int, text string) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+
 	if !se.enabled {
 		return
 	}
@@ -218,7 +243,47 @@ func (se *SyntaxEditor) UpdateLineRange(startLine, endLine int, text string) {
 		if lineNum > endLine {
 			break
 		}
-		se.updateLine(lineNum, line)
+		// Create the styled row with line number (lineNum is 0-indexed, display as 1-indexed)
+		isHighlighted := (lineNum + 1) == se.highlightedLine
+		row := se.createStyledRow(lineNum+1, line, se.maxLineNumWidth, isHighlighted)
+		// Set the row in TextGrid
+		if lineNum < len(se.textGrid.Rows) {
+			se.textGrid.SetRow(lineNum, row)
+		}
+	}
+
+	se.textGrid.Refresh()
+}
+
+// SetHighlightedLine sets the line to highlight (1-indexed, 0 to clear)
+func (se *SyntaxEditor) SetHighlightedLine(lineNum int) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+
+	oldLine := se.highlightedLine
+	if oldLine == lineNum {
+		return // No change needed
+	}
+
+	se.highlightedLine = lineNum
+
+	// Only update the affected lines instead of rebuilding everything
+	lines := strings.Split(se.textGrid.Text(), "\n")
+
+	// Update old highlighted line (remove highlight)
+	if oldLine > 0 && oldLine-1 < len(lines) {
+		row := se.createStyledRow(oldLine, lines[oldLine-1], se.maxLineNumWidth, false)
+		if oldLine-1 < len(se.textGrid.Rows) {
+			se.textGrid.SetRow(oldLine-1, row)
+		}
+	}
+
+	// Update new highlighted line (add highlight)
+	if lineNum > 0 && lineNum-1 < len(lines) {
+		row := se.createStyledRow(lineNum, lines[lineNum-1], se.maxLineNumWidth, true)
+		if lineNum-1 < len(se.textGrid.Rows) {
+			se.textGrid.SetRow(lineNum-1, row)
+		}
 	}
 
 	se.textGrid.Refresh()
