@@ -277,7 +277,7 @@ func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id
 		}
 	}(c)
 
-	ds, err := delta_sharing.NewSharingClientFromString(profile)
+	ds, err := delta_sharing.NewSharingClientV2FromString(profile)
 	if err != nil {
 		dialog.NewError(err, t.w).Show()
 		c <- true

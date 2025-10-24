@@ -315,7 +315,7 @@ func ShowQueryOptionsDialogWithSchema(w fyne.Window, profile string, table delta
 	// Launch single background goroutine to load schema
 	go func() {
 		// Perform schema loading (network I/O, no UI operations)
-		ds, err := delta_sharing.NewSharingClientFromString(profile)
+		ds, err := delta_sharing.NewSharingClientV2FromString(profile)
 		if err != nil {
 			progressBar.Stop()
 			progressDialog.Hide()

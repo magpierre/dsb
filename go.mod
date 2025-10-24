@@ -6,7 +6,7 @@ require (
 	fyne.io/fyne/v2 v2.7.0
 	github.com/apache/arrow-go/v18 v18.4.1
 	github.com/magpierre/fyne-datatable v0.0.0
-	github.com/magpierre/go_delta_sharing_client v0.1.1
+	github.com/magpierre/go_delta_sharing_client v0.1.2
 	github.com/traefik/yaegi v0.16.1
 )
 
@@ -35,13 +35,12 @@ require (
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/flatbuffers v25.9.23+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/grundprinzip/unofficial-dbconnect-go v0.0.3 // indirect
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/jeandeaual/go-locale v0.0.0-20250612000132-0ef82f21eade // indirect
 	github.com/jsummers/gobmp v0.0.0-20230614200233-a9de23ed2e25 // indirect
 	github.com/klauspost/asmfmt v1.3.2 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.18.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/minio/asm2plan9s v0.0.0-20200509001527-cdd76441f9d8 // indirect
 	github.com/minio/c2goasm v0.0.0-20190812172519-36a3d3bbc4f3 // indirect
@@ -55,17 +54,17 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/yuin/goldmark v1.7.8 // indirect
 	github.com/zeebo/xxh3 v1.0.2 // indirect
-	golang.org/x/exp v0.0.0-20251009144603-d2f985daa21b // indirect
+	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/mod v0.29.0 // indirect
 	golang.org/x/net v0.46.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.37.0 // indirect
-	golang.org/x/telemetry v0.0.0-20251014153721-24f779f6aaef // indirect
+	golang.org/x/telemetry v0.0.0-20251022145735-5be28d707443 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251014184007-4626949a642f // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20251022142026-3a174f9686a8 // indirect
 	google.golang.org/grpc v1.76.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

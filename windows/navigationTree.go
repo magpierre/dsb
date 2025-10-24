@@ -52,7 +52,7 @@ type NavigationTree struct {
 	nodes   map[string]*TreeNode
 	rootIDs []string
 	profile string
-	client  delta_sharing.SharingClient
+	client  delta_sharing.SharingClientV2
 	mainWin *MainWindow
 	mu      sync.RWMutex // Protect concurrent access during lazy loading
 }
@@ -109,8 +109,8 @@ func (nt *NavigationTree) LoadShares(profile string) error {
 
 	nt.profile = profile
 
-	// Create Delta Sharing client
-	client, err := delta_sharing.NewSharingClientFromString(profile)
+	// Create Delta Sharing V2 client for improved performance
+	client, err := delta_sharing.NewSharingClientV2FromString(profile)
 	if err != nil {
 		return fmt.Errorf("failed to create Delta Sharing client: %w", err)
 	}
@@ -143,8 +143,9 @@ func (nt *NavigationTree) LoadShares(profile string) error {
 		shareMap[share.Name] = node
 	}
 
-	// Preload all tables using ListAllTables
-	allTables, _, err := client.ListAllTables(context.Background(), 0, "")
+	// Preload all tables using ListAllTables_V2 with concurrency for better performance
+	// maxConcurrency=0 uses the default value (10)
+	allTables, _, err := client.ListAllTables_V2(context.Background(), 0, "", 0)
 	if err != nil {
 		return fmt.Errorf("failed to list all tables: %w", err)
 	}

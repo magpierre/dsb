@@ -771,7 +771,7 @@ func (t *MainWindow) handleTreeRightClick(nodeID widget.TreeNodeID, e *fyne.Poin
 
 // loadTableData loads and displays data for a table
 func (t *MainWindow) loadTableData(table delta_sharing.Table, options *QueryOptions) {
-	ds, err := delta_sharing.NewSharingClientFromString(t.profile)
+	ds, err := delta_sharing.NewSharingClientV2FromString(t.profile)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("failed to create client: %w", err), t.w)
 		return
