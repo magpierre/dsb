@@ -31,7 +31,6 @@ type SyntaxEditor struct {
 	textGrid        *widget.TextGrid
 	enabled         bool
 	onChange        func(string)
-	placeholder     string
 	maxLineNumWidth int        // Width needed for line numbers
 	highlightedLine int        // Currently highlighted line (1-indexed, 0 = none)
 	mu              sync.Mutex // Protects textGrid from concurrent access
@@ -138,21 +137,6 @@ func (se *SyntaxEditor) createStyledRow(lineNum int, lineText string, maxLineNum
 	return row
 }
 
-// updateLine parses and styles a single line with line number
-func (se *SyntaxEditor) updateLine(lineNum int, lineText string) {
-	se.mu.Lock()
-	defer se.mu.Unlock()
-
-	// Create the styled row with line number (lineNum is 0-indexed, display as 1-indexed)
-	isHighlighted := (lineNum + 1) == se.highlightedLine
-	row := se.createStyledRow(lineNum+1, lineText, se.maxLineNumWidth, isHighlighted)
-
-	// Set the row in TextGrid
-	if lineNum < len(se.textGrid.Rows) {
-		se.textGrid.SetRow(lineNum, row)
-	}
-}
-
 // GetText returns the current text content
 func (se *SyntaxEditor) GetText() string {
 	se.mu.Lock()
@@ -165,13 +149,6 @@ func (se *SyntaxEditor) Text() string {
 	se.mu.Lock()
 	defer se.mu.Unlock()
 	return se.textGrid.Text()
-}
-
-// SetPlaceHolder sets placeholder text (shown when empty)
-func (se *SyntaxEditor) SetPlaceHolder(text string) {
-	se.placeholder = text
-	// Note: TextGrid doesn't have native placeholder support
-	// Could implement by showing gray text when empty
 }
 
 // SetOnChanged sets the callback for text changes

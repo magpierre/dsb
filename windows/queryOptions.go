@@ -23,25 +23,27 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
-	"github.com/apache/arrow-go/v18/arrow"
 	delta_sharing "github.com/magpierre/go_delta_sharing_client"
 )
 
-// QueryOptions holds the query configuration for table data loading
+// QueryOptions holds the query configuration for table data loading.
+//
+// NOTE: These options are currently applied CLIENT-SIDE after data is fetched.
+// Future enhancement: Push these to the Delta Sharing server via query parameters
+// to reduce network data transfer (requires delta_sharing library API update).
 type QueryOptions struct {
-	SelectedColumns []string
-	Predicate       string
-	Limit           int64
+	SelectedColumns []string // Columns to include (empty = all columns)
+	Predicate       string   // SQL WHERE clause for filtering (e.g., "age > 25 AND status = 'active'")
+	Limit           int64    // Maximum rows to return (-1 = no limit)
 }
 
 // QueryOptionsDialog creates a dialog for configuring query options
 type QueryOptionsDialog struct {
 	dialog         dialog.Dialog
 	window         fyne.Window
-	schema         *arrow.Schema
+	schema         *delta_sharing.SparkSchema
 	columnChecks   map[string]*widget.Check
 	predicateEntry *widget.Entry
 	limitEntry     *widget.Entry
@@ -49,7 +51,7 @@ type QueryOptionsDialog struct {
 }
 
 // NewQueryOptionsDialog creates a new query options dialog
-func NewQueryOptionsDialog(w fyne.Window, schema *arrow.Schema, callback func(*QueryOptions)) *QueryOptionsDialog {
+func NewQueryOptionsDialog(w fyne.Window, schema *delta_sharing.SparkSchema, callback func(*QueryOptions)) *QueryOptionsDialog {
 	qod := &QueryOptionsDialog{
 		window:       w,
 		schema:       schema,
@@ -84,8 +86,10 @@ func (qod *QueryOptionsDialog) createDialog() {
 	selectButtons := container.NewHBox(selectAllBtn, deselectAllBtn)
 
 	if qod.schema != nil {
-		for _, field := range qod.schema.Fields() {
-			check := widget.NewCheck(fmt.Sprintf("%s (%s)", field.Name, field.Type), nil)
+		for _, field := range qod.schema.Fields {
+			// Format the type for display
+			typeStr := fmt.Sprintf("%v", field.Type)
+			check := widget.NewCheck(fmt.Sprintf("%s (%s)", field.Name, typeStr), nil)
 			check.SetChecked(true) // Default to all columns selected
 			qod.columnChecks[field.Name] = check
 			columnCheckboxes.Add(check)
@@ -193,116 +197,16 @@ func (qod *QueryOptionsDialog) Show() {
 	qod.dialog.Show()
 }
 
-// SimpleQueryOptionsDialog creates a simplified query options dialog without schema
-func SimpleQueryOptionsDialog(w fyne.Window, callback func(*QueryOptions)) {
-	predicateEntry := widget.NewMultiLineEntry()
-	predicateEntry.SetPlaceHolder("e.g., age > 25 AND status = 'active'")
-	predicateEntry.SetMinRowsVisible(3)
-
-	limitEntry := widget.NewEntry()
-	limitEntry.SetPlaceHolder("Leave empty for all rows")
-
-	predicateLabel := widget.NewLabel("Filter Predicate (SQL WHERE clause):")
-	predicateLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	limitLabel := widget.NewLabel("Row Limit:")
-	limitLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	limitHelp := widget.NewLabel("Maximum number of rows to return.")
-	limitHelp.TextStyle = fyne.TextStyle{Italic: true}
-
-	columnEntry := widget.NewEntry()
-	columnEntry.SetPlaceHolder("Leave empty for all columns, or comma-separated list")
-
-	columnLabel := widget.NewLabel("Select Columns:")
-	columnLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	columnHelp := widget.NewLabel("Comma-separated column names (e.g., id,name,age)")
-	columnHelp.TextStyle = fyne.TextStyle{Italic: true}
-
-	content := container.NewVBox(
-		columnLabel,
-		columnEntry,
-		columnHelp,
-		widget.NewSeparator(),
-		predicateLabel,
-		predicateEntry,
-		widget.NewLabel("Leave empty for no filtering."),
-		widget.NewSeparator(),
-		limitLabel,
-		limitEntry,
-		limitHelp,
-	)
-
-	d := dialog.NewCustomConfirm(
-		"Query Options",
-		"Load Data",
-		"Cancel",
-		content,
-		func(confirmed bool) {
-			if !confirmed {
-				return
-			}
-
-			options := &QueryOptions{
-				SelectedColumns: make([]string, 0),
-			}
-
-			// Parse columns
-			colText := strings.TrimSpace(columnEntry.Text)
-			if colText != "" {
-				cols := strings.Split(colText, ",")
-				for _, col := range cols {
-					trimmed := strings.TrimSpace(col)
-					if trimmed != "" {
-						options.SelectedColumns = append(options.SelectedColumns, trimmed)
-					}
-				}
-			}
-
-			// Get predicate
-			options.Predicate = strings.TrimSpace(predicateEntry.Text)
-
-			// Get limit
-			limitText := strings.TrimSpace(limitEntry.Text)
-			if limitText != "" {
-				limit, err := strconv.ParseInt(limitText, 10, 64)
-				if err != nil || limit <= 0 {
-					dialog.ShowError(fmt.Errorf("invalid limit: must be a positive number"), w)
-					return
-				}
-				options.Limit = limit
-			} else {
-				options.Limit = -1 // No limit
-			}
-
-			if callback != nil {
-				callback(options)
-			}
-		},
-		w,
-	)
-
-	d.Resize(fyne.NewSize(500, 500))
-	d.Show()
-}
-
-// ListWithContextMenu creates a list widget with context menu support
-func NewListWithContextMenu(data binding.StringList, onSelected func(widget.ListItemID), onContextMenu func(widget.ListItemID)) *widget.List {
-	list := widget.NewListWithData(data, func() fyne.CanvasObject {
-		return widget.NewLabel("template")
-	}, func(di binding.DataItem, co fyne.CanvasObject) {
-		co.(*widget.Label).Bind(di.(binding.String))
-	})
-
-	if onSelected != nil {
-		list.OnSelected = onSelected
-	}
-
-	return list
-}
-
 // ShowQueryOptionsDialogWithSchema loads table schema and shows enhanced query options dialog
+//
+// NOTE: Query options (predicateHints, limitHint, column selection) are currently applied
+// CLIENT-SIDE after data is fetched from the Delta Sharing server. This means all data
+// matching the table is transferred over the network before filtering.
+//
+// TODO: Once the delta_sharing library exposes query pushdown parameters in its public API,
+// update this to push predicates and limits to the server to reduce data transfer.
+// The internal protocol already supports this (see protocol.data struct), but it's not
+// currently exposed in ListFilesInTable or LoadArrowTable methods.
 func ShowQueryOptionsDialogWithSchema(w fyne.Window, profile string, table delta_sharing.Table, callback func(*QueryOptions)) {
 	// Create and show progress dialog on calling thread (which should be main/UI thread)
 	progressBar := widget.NewProgressBarInfinite()
@@ -324,35 +228,26 @@ func ShowQueryOptionsDialogWithSchema(w fyne.Window, profile string, table delta
 			return
 		}
 
-		resp, err := ds.ListFilesInTable(context.Background(), table)
+		// Use GetTableMetadata to fetch schema without loading actual data
+		// This is much faster than loading a file just to read the schema
+		metadata, err := ds.GetTableMetadata(context.Background(), table)
 		if err != nil {
 			progressBar.Stop()
 			progressDialog.Hide()
 			time.Sleep(50 * time.Millisecond)
-			dialog.ShowError(fmt.Errorf("failed to list files: %w", err), w)
+			dialog.ShowError(fmt.Errorf("failed to get table metadata: %w", err), w)
 			return
 		}
 
-		if len(resp.AddFiles) == 0 {
-			progressBar.Stop()
-			progressDialog.Hide()
-			time.Sleep(50 * time.Millisecond)
-			dialog.ShowError(fmt.Errorf("no files available for table"), w)
-			return
-		}
-
-		fileID := resp.AddFiles[0].Id
-		arrowTable, err := delta_sharing.LoadArrowTable(context.Background(), ds, table, fileID)
+		// Extract Spark schema from metadata
+		sparkSchema, err := metadata.GetSparkSchema()
 		if err != nil {
 			progressBar.Stop()
 			progressDialog.Hide()
 			time.Sleep(50 * time.Millisecond)
-			dialog.ShowError(fmt.Errorf("failed to load schema: %w", err), w)
+			dialog.ShowError(fmt.Errorf("failed to parse schema: %w", err), w)
 			return
 		}
-
-		schema := arrowTable.Schema()
-		arrowTable.Release()
 
 		// Close progress dialog
 		progressBar.Stop()
@@ -362,7 +257,7 @@ func ShowQueryOptionsDialogWithSchema(w fyne.Window, profile string, table delta
 		time.Sleep(100 * time.Millisecond)
 
 		// Create and show query options dialog
-		qod := NewQueryOptionsDialog(w, schema, callback)
+		qod := NewQueryOptionsDialog(w, sparkSchema, callback)
 		qod.Show()
 	}()
 }
