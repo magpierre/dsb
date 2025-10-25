@@ -31,14 +31,12 @@ import (
 // GoEditor manages the Go code editor and output pane
 type GoEditor struct {
 	w             fyne.Window
+	app           fyne.App
 	codeEditor    *CursorTrackingEntry
 	syntaxEditor  *SyntaxEditor
 	outputText    *widget.RichText
 	executeButton *widget.Button
-	clearButton   *widget.Button
-	saveButton    *widget.Button
 	container     *fyne.Container
-	interpreter   *interp.Interpreter
 }
 
 // CursorTrackingEntry extends widget.Entry to track cursor movements
@@ -82,9 +80,10 @@ func (e *CursorTrackingEntry) SetOnCursorChanged(callback func()) {
 }
 
 // NewGoEditor creates a new Go editor instance
-func NewGoEditor(w fyne.Window) *GoEditor {
+func NewGoEditor(w fyne.Window, app fyne.App) *GoEditor {
 	ge := &GoEditor{
-		w: w,
+		w:   w,
+		app: app,
 	}
 	ge.createUI()
 	return ge
@@ -119,18 +118,9 @@ func (ge *GoEditor) createUI() {
 	// Set initial placeholder text
 	ge.setOutput("Output will appear here...")
 
-	// Note: Buttons are now in the main window toolbar and only visible when Go Editor is selected
-	// These button fields are kept for compatibility but no longer used in the UI
+	// Note: Execute button is now in the main window toolbar and only visible when Go Editor is selected
 	ge.executeButton = widget.NewButtonWithIcon("Execute (interpreter mode)", theme.MediaPlayIcon(), func() {
 		ge.executeCode()
-	})
-
-	ge.clearButton = widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), func() {
-		ge.clearOutput()
-	})
-
-	ge.saveButton = widget.NewButtonWithIcon("Save Code", theme.DocumentSaveIcon(), func() {
-		ge.saveCode()
 	})
 
 	// Create scroll containers (no sync needed)
@@ -333,6 +323,14 @@ func (ge *GoEditor) saveCode() {
 
 		defer writer.Close()
 
+		// Save the directory for next time
+		if ge.app != nil && writer.URI() != nil {
+			listableURI, err := storage.ListerForURI(writer.URI())
+			if err == nil {
+				ge.app.Preferences().SetString("lastGoEditorDir", listableURI.String())
+			}
+		}
+
 		// Write the file (synchronous)
 		_, err = writer.Write([]byte(code))
 		if err != nil {
@@ -346,6 +344,20 @@ func (ge *GoEditor) saveCode() {
 	// Set default filename and filter for Go files
 	saveDialog.SetFileName("code.go")
 	saveDialog.SetFilter(storage.NewExtensionFileFilter([]string{".go"}))
+
+	// Set the starting location to the last used directory
+	if ge.app != nil {
+		dirStr := ge.app.Preferences().String("lastGoEditorDir")
+		if dirStr != "" {
+			uri, err := storage.ParseURI(dirStr)
+			if err == nil {
+				listableURI, err := storage.ListerForURI(uri)
+				if err == nil {
+					saveDialog.SetLocation(listableURI)
+				}
+			}
+		}
+	}
 
 	// Show the dialog
 	saveDialog.Show()
@@ -365,6 +377,14 @@ func (ge *GoEditor) loadCode() {
 		}
 
 		defer reader.Close()
+
+		// Save the directory for next time
+		if ge.app != nil && reader.URI() != nil {
+			listableURI, err := storage.ListerForURI(reader.URI())
+			if err == nil {
+				ge.app.Preferences().SetString("lastGoEditorDir", listableURI.String())
+			}
+		}
 
 		// Read the file (synchronous)
 		fileContent := make([]byte, 0)
@@ -387,6 +407,20 @@ func (ge *GoEditor) loadCode() {
 
 	// Set filter for Go files
 	openDialog.SetFilter(storage.NewExtensionFileFilter([]string{".go"}))
+
+	// Set the starting location to the last used directory
+	if ge.app != nil {
+		dirStr := ge.app.Preferences().String("lastGoEditorDir")
+		if dirStr != "" {
+			uri, err := storage.ParseURI(dirStr)
+			if err == nil {
+				listableURI, err := storage.ListerForURI(uri)
+				if err == nil {
+					openDialog.SetLocation(listableURI)
+				}
+			}
+		}
+	}
 
 	// Show the dialog
 	openDialog.Show()

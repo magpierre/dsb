@@ -15,7 +15,6 @@
 package windows
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"time"
@@ -36,17 +35,19 @@ import (
 
 // Data holds information about a table tab.
 type Data struct {
-	model      *datatable.TableModel
-	dataTable  *dtwidget.DataTable
-	tab        *container.TabItem
-	tableName  string
-	arrowTable arrow.Table // Keep reference for export
+	model         *datatable.TableModel
+	dataTable     *dtwidget.DataTable
+	tab           *container.TabItem
+	tableName     string
+	arrowTable    arrow.Table // Keep reference for export
+	selectedRow   int         // Currently selected row (-1 if none)
+	selectedCol   int         // Currently selected column (-1 if none)
+	selectedValue string      // Value of the selected cell
 }
 
 // DataBrowser manages the display of Delta Sharing table data.
 type DataBrowser struct {
 	w              fyne.Window
-	Data           []Data
 	innerTabs      *container.DocTabs
 	docTabs        *container.DocTabs
 	browserTab     *container.TabItem
@@ -58,7 +59,6 @@ type DataBrowser struct {
 func (t *DataBrowser) CreateWindow(docTabs *container.DocTabs, statusCallback func(string)) {
 	t.w = fyne.CurrentApp().Driver().AllWindows()[0]
 	t.docTabs = docTabs
-	t.Data = make([]Data, 0)
 	t.tabDataMap = make(map[*container.TabItem]*Data)
 	t.statusCallback = statusCallback
 
@@ -173,7 +173,7 @@ func (t *DataBrowser) CreateDataBrowser(
 	config.ShowColumnSelector = true                 // Enable built-in column selector
 	config.ShowSettingsButton = true                 // Enable settings button
 	config.AutoAdjustColumnWidths = true             // Auto-adjust columns to fit headers
-	config.SelectionMode = dtwidget.SelectionModeRow // Enable row selection for copy functionality
+	config.SelectionMode = dtwidget.SelectionModeRow // Enable row selection for copy functionality (default)
 	config.MinColumnWidth = 100
 
 	dataTable := dtwidget.NewDataTableWithConfig(model, config)
@@ -184,16 +184,33 @@ func (t *DataBrowser) CreateDataBrowser(
 	// Sorting is now automatic! No handler needed.
 	// Column selection is now automatic! No manual UI needed.
 
-	// Optional: Setup selection handler for debugging (handles both cell and row modes)
+	// Create tab name
+	tabName := delta_table.Name
+
+	// Create data struct first so callback can reference it
+	data := &Data{
+		model:         model,
+		dataTable:     dataTable,
+		tableName:     delta_table.Name,
+		arrowTable:    arrowTable, // Keep reference for export
+		selectedRow:   -1,         // No selection initially
+		selectedCol:   -1,         // No selection initially
+		selectedValue: "",
+	}
+
+	// Setup selection handler to track selections for status updates
+	// Note: Clipboard copy is handled automatically by the DataTable widget via:
+	// - CMD+C / Ctrl+C keyboard shortcuts
+	// - Plain C key when widget has focus
+	// - These shortcuts properly handle multi-row selection
 	dataTable.OnCellSelected(func(row, col int) {
+		// Store selection
+		data.selectedRow = row
+		data.selectedCol = col
+
 		if col == -1 {
 			// Row selection mode
-			rowData, err := model.VisibleRow(row)
-			if err != nil {
-				log.Printf("Row selection error: %v", err)
-				return
-			}
-			log.Printf("Row %d selected: %v", row, rowData)
+			log.Printf("Row %d selected (use Cmd+C or C to copy selected rows)", row)
 		} else {
 			// Cell selection mode
 			cell, err := model.VisibleCell(row, col)
@@ -202,6 +219,8 @@ func (t *DataBrowser) CreateDataBrowser(
 				return
 			}
 			colName, _ := model.VisibleColumnName(col)
+			data.selectedValue = cell.Formatted
+
 			log.Printf("Cell selected: [%d, %d] (%s) = %s", row, col, colName, cell.Formatted)
 		}
 	})
@@ -213,23 +232,13 @@ func (t *DataBrowser) CreateDataBrowser(
 	// CMD+C (Mac) / Ctrl+C (Windows/Linux) is registered in SetWindow()
 	// Plain C key is handled by the widget's TypedKey when it has focus
 
-	// Create tab with the wrapped content
-	tabName := delta_table.Name
+	// Create tab with the wrapped content and update data
 	newTab := container.NewTabItem(tabName, content)
-
-	// Store data
-	data := &Data{
-		model:      model,
-		dataTable:  dataTable,
-		tab:        newTab,
-		tableName:  delta_table.Name,
-		arrowTable: arrowTable, // Keep reference for export
-	}
+	data.tab = newTab
 
 	// Retain Arrow table to prevent it from being released
 	arrowTable.Retain()
 
-	t.Data = append(t.Data, *data)
 	t.tabDataMap[newTab] = data
 
 	t.innerTabs.Append(newTab)
@@ -257,7 +266,7 @@ func (t *DataBrowser) CreateDataBrowser(
 }
 
 // GetData fetches data from Delta Sharing and creates a browser tab.
-func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id string, options *QueryOptions) {
+func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id string, options *QueryOptions, apiTimeout int) {
 	c := make(chan bool)
 	go func(c chan bool) {
 		pbi := widget.NewProgressBarInfinite()
@@ -284,7 +293,10 @@ func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id
 		return
 	}
 
-	resp, err := ds.ListFilesInTable(context.Background(), table)
+	// Use configurable timeout for API calls
+	ctx, cancel := createTimeoutContext(apiTimeout)
+	defer cancel()
+	resp, err := ds.ListFilesInTable(ctx, table)
 	if err != nil {
 		dialog.NewError(err, t.w).Show()
 		c <- true
@@ -293,7 +305,10 @@ func (t *DataBrowser) GetData(profile string, table delta_sharing.Table, file_id
 
 	for _, v := range resp.AddFiles {
 		if v.Id == file_id {
-			arrow_table, err := delta_sharing.LoadArrowTable(context.Background(), ds, table, file_id)
+			// Use a new context with configurable timeout for loading Arrow table
+			ctx2, cancel2 := createTimeoutContext(apiTimeout)
+			defer cancel2()
+			arrow_table, err := delta_sharing.LoadArrowTable(ctx2, ds, table, file_id)
 			if err != nil {
 				dialog.NewError(err, t.w).Show()
 				c <- true

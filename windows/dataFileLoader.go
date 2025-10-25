@@ -15,6 +15,7 @@
 package windows
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -83,6 +84,67 @@ func isDeltaSharingProfile(content string) bool {
 	return hasVersion && hasEndpoint && hasBearerToken
 }
 
+// detectCSVSeparator tries to detect the CSV separator from the first line
+func detectCSVSeparator(filePath string) (rune, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return ',', fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		// Empty file or error, use default comma
+		return ',', nil
+	}
+
+	firstLine := scanner.Text()
+	if firstLine == "" {
+		return ',', nil
+	}
+
+	// Count occurrences of common separators
+	separators := map[rune]int{
+		',':  strings.Count(firstLine, ","),
+		';':  strings.Count(firstLine, ";"),
+		'\t': strings.Count(firstLine, "\t"),
+		'|':  strings.Count(firstLine, "|"),
+	}
+
+	// Find the separator with the highest count
+	maxCount := 0
+	detectedSep := ','
+	for sep, count := range separators {
+		if count > maxCount {
+			maxCount = count
+			detectedSep = sep
+		}
+	}
+
+	// If no separator was found (all counts are 0), default to comma
+	if maxCount == 0 {
+		return ',', nil
+	}
+
+	return detectedSep, nil
+}
+
+// getSeparatorName returns a human-readable name for the separator
+func getSeparatorName(sep rune) string {
+	switch sep {
+	case ',':
+		return "comma"
+	case ';':
+		return "semicolon"
+	case '\t':
+		return "tab"
+	case '|':
+		return "pipe"
+	default:
+		return string(sep)
+	}
+}
+
 // LoadDataFile loads a data file using the appropriate adapter and displays it
 func (t *MainWindow) LoadDataFile(filePath string) error {
 	fileType := DetectFileType(filePath, "")
@@ -103,10 +165,17 @@ func (t *MainWindow) LoadDataFile(filePath string) error {
 func (t *MainWindow) loadCSVFile(filePath string) error {
 	t.SetStatus("Loading CSV file: " + filepath.Base(filePath))
 
-	// Use CSV adapter to load the file
+	// Detect the CSV separator from the first line
+	separator, err := detectCSVSeparator(filePath)
+	if err != nil {
+		separator = ','
+	}
+
+	// Use CSV adapter to load the file with detected separator
 	config := csvadapter.DefaultConfig()
 	config.HasHeaders = true
 	config.TrimSpace = true
+	config.Delimiter = separator
 
 	dataSource, err := csvadapter.NewFromFile(filePath, config)
 	if err != nil {
@@ -121,8 +190,11 @@ func (t *MainWindow) loadCSVFile(filePath string) error {
 
 	// Display the data
 	t.displayDataTable(model, filepath.Base(filePath))
-	t.SetStatus(fmt.Sprintf("Loaded CSV file: %s (%d rows, %d columns)",
-		filepath.Base(filePath), dataSource.RowCount(), dataSource.ColumnCount()))
+
+	// Show which separator was detected
+	separatorName := getSeparatorName(separator)
+	t.SetStatus(fmt.Sprintf("Loaded CSV file: %s (%d rows, %d columns, separator: %s)",
+		filepath.Base(filePath), dataSource.RowCount(), dataSource.ColumnCount(), separatorName))
 
 	return nil
 }
@@ -233,11 +305,23 @@ func (t *MainWindow) loadJSONFile(filePath string) error {
 
 // displayDataTable creates and displays a datatable widget with the given model
 func (t *MainWindow) displayDataTable(model *datatable.TableModel, tabName string) {
-	// Create the datatable widget
-	dt := fynewidget.NewDataTable(model)
+	// Create widget with configuration - row selection enabled for copy functionality
+	config := fynewidget.DefaultConfig()
+	config.ShowFilterBar = true
+	config.ShowStatusBar = true
+	config.ShowColumnSelector = true
+	config.ShowSettingsButton = true
+	config.AutoAdjustColumnWidths = true
+	config.SelectionMode = fynewidget.SelectionModeRow // Enable row selection for copy functionality (default)
+	config.MinColumnWidth = 100
 
-	// Create a scroll container for the datatable
+	dt := fynewidget.NewDataTableWithConfig(model, config)
+
+	// Set window reference for keyboard shortcuts
+	dt.SetWindow(t.w)
+
 	scroll := container.NewScroll(dt)
+	// Create a scroll container for the datatable
 
 	// Create a card to hold the datatable
 	card := widget.NewCard("", tabName, scroll)
@@ -272,6 +356,7 @@ func (t *MainWindow) handleDataFileLoad(filePath string) {
 				Title:   "Error Loading File",
 				Content: errMsg,
 			})
+			fmt.Println("Error loading file: " + errMsg)
 			t.SetStatus("Error loading file: " + errMsg)
 		}
 	}()

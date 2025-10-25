@@ -28,12 +28,12 @@ var DeltaSharingSymbols = map[string]map[string]reflect.Value{}
 func init() {
 	DeltaSharingSymbols["github.com/magpierre/go_delta_sharing_client/delta_sharing"] = map[string]reflect.Value{
 		// function, constant and variable definitions
-		"LoadArrowTable":                reflect.ValueOf(delta_sharing.LoadArrowTable),
-		"LoadAsArrowTable":              reflect.ValueOf(delta_sharing.LoadAsArrowTable),
-		"NewSharingClient":              reflect.ValueOf(delta_sharing.NewSharingClient),
-		"NewSharingClientFromString":    reflect.ValueOf(delta_sharing.NewSharingClientFromString),
-		"NewSharingClientV2":            reflect.ValueOf(delta_sharing.NewSharingClientV2),
-		"NewSharingClientV2FromString":  reflect.ValueOf(delta_sharing.NewSharingClientV2FromString),
+		"LoadArrowTable":               reflect.ValueOf(delta_sharing.LoadArrowTable),
+		"LoadAsArrowTable":             reflect.ValueOf(delta_sharing.LoadAsArrowTable),
+		"NewSharingClient":             reflect.ValueOf(delta_sharing.NewSharingClient),
+		"NewSharingClientFromString":   reflect.ValueOf(delta_sharing.NewSharingClientFromString),
+		"NewSharingClientV2":           reflect.ValueOf(delta_sharing.NewSharingClientV2),
+		"NewSharingClientV2FromString": reflect.ValueOf(delta_sharing.NewSharingClientV2FromString),
 
 		// type definitions
 		"CDFFile":         reflect.ValueOf((*delta_sharing.CDFFile)(nil)),

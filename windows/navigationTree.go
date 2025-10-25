@@ -15,7 +15,6 @@
 package windows
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -116,8 +115,10 @@ func (nt *NavigationTree) LoadShares(profile string) error {
 	}
 	nt.client = client
 
-	// Fetch shares from server
-	shares, _, err := client.ListShares(context.Background(), 0, "")
+	// Fetch shares from server with configurable timeout
+	ctx, cancel := createTimeoutContext(nt.mainWin.apiTimeout)
+	defer cancel()
+	shares, _, err := client.ListShares(ctx, 0, "")
 	if err != nil {
 		return fmt.Errorf("failed to list shares: %w", err)
 	}
@@ -145,7 +146,10 @@ func (nt *NavigationTree) LoadShares(profile string) error {
 
 	// Preload all tables using ListAllTables_V2 with concurrency for better performance
 	// maxConcurrency=0 uses the default value (10)
-	allTables, _, err := client.ListAllTables_V2(context.Background(), 0, "", 0)
+	// Use a new context with configurable timeout for this call
+	ctx2, cancel2 := createTimeoutContext(nt.mainWin.apiTimeout)
+	defer cancel2()
+	allTables, _, err := client.ListAllTables_V2(ctx2, 0, "", 0)
 	if err != nil {
 		return fmt.Errorf("failed to list all tables: %w", err)
 	}
@@ -261,141 +265,6 @@ func (nt *NavigationTree) GetNode(nodeID widget.TreeNodeID) *TreeNode {
 	defer nt.mu.RUnlock()
 
 	return nt.nodes[nodeID]
-}
-
-// LazyLoadChildren is no longer needed since all data is preloaded
-// This method is kept for compatibility but will always return early
-func (nt *NavigationTree) LazyLoadChildren(nodeID widget.TreeNodeID) error {
-	nt.mu.RLock()
-	defer nt.mu.RUnlock()
-
-	node, exists := nt.nodes[nodeID]
-	if !exists {
-		return fmt.Errorf("node not found: %s", nodeID)
-	}
-
-	// All children are preloaded, so this should always be true
-	if node.ChildrenLoaded {
-		return nil
-	}
-
-	// This shouldn't happen with preloading, but handle gracefully
-	return nil
-}
-
-// loadSchemas fetches schemas for a share node
-func (nt *NavigationTree) loadSchemas(shareNode *TreeNode) error {
-	// Find the share object
-	shares, _, err := nt.client.ListShares(context.Background(), 0, "")
-	if err != nil {
-		return fmt.Errorf("failed to list shares: %w", err)
-	}
-
-	// Use type inference - share type is unexported
-	var shareObj = shares[0] // Will be replaced by actual match
-	found := false
-	for _, s := range shares {
-		if s.Name == shareNode.Share {
-			shareObj = s
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("share not found: %s", shareNode.Share)
-	}
-
-	// Fetch schemas
-	schemas, _, err := nt.client.ListSchemas(context.Background(), shareObj, 0, "")
-	if err != nil {
-		return fmt.Errorf("failed to list schemas: %w", err)
-	}
-
-	// Create schema nodes
-	shareNode.Children = make([]string, 0, len(schemas))
-	for _, schema := range schemas {
-		nodeID := nt.GenerateNodeID(NodeTypeSchema, shareNode.Share, schema.Name, "")
-		schemaNode := &TreeNode{
-			ID:             nodeID,
-			NodeType:       NodeTypeSchema,
-			Name:           schema.Name,
-			Share:          shareNode.Share,
-			Schema:         schema.Name,
-			Children:       nil, // Will be lazy-loaded
-			ChildrenLoaded: false,
-		}
-		nt.nodes[nodeID] = schemaNode
-		shareNode.Children = append(shareNode.Children, nodeID)
-	}
-
-	shareNode.ChildrenLoaded = true
-	return nil
-}
-
-// loadTables fetches tables for a schema node
-func (nt *NavigationTree) loadTables(schemaNode *TreeNode) error {
-	// Find the share and schema objects
-	shares, _, err := nt.client.ListShares(context.Background(), 0, "")
-	if err != nil {
-		return fmt.Errorf("failed to list shares: %w", err)
-	}
-
-	// Use type inference - share type is unexported
-	var shareObj = shares[0] // Will be replaced by actual match
-	for _, s := range shares {
-		if s.Name == schemaNode.Share {
-			shareObj = s
-			break
-		}
-	}
-
-	schemas, _, err := nt.client.ListSchemas(context.Background(), shareObj, 0, "")
-	if err != nil {
-		return fmt.Errorf("failed to list schemas: %w", err)
-	}
-
-	// Use type inference - schema type is unexported
-	var schemaObj = schemas[0] // Will be replaced by actual match
-	found := false
-	for _, s := range schemas {
-		if s.Name == schemaNode.Schema {
-			schemaObj = s
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return fmt.Errorf("schema not found: %s", schemaNode.Schema)
-	}
-
-	// Fetch tables
-	tables, _, err := nt.client.ListTables(context.Background(), schemaObj, 0, "")
-	if err != nil {
-		return fmt.Errorf("failed to list tables: %w", err)
-	}
-
-	// Create table nodes
-	schemaNode.Children = make([]string, 0, len(tables))
-	for _, table := range tables {
-		nodeID := nt.GenerateNodeID(NodeTypeTable, schemaNode.Share, schemaNode.Schema, table.Name)
-		tableNode := &TreeNode{
-			ID:             nodeID,
-			NodeType:       NodeTypeTable,
-			Name:           table.Name,
-			Share:          schemaNode.Share,
-			Schema:         schemaNode.Schema,
-			Table:          table,
-			Children:       nil,
-			ChildrenLoaded: true, // Tables don't have children
-		}
-		nt.nodes[nodeID] = tableNode
-		schemaNode.Children = append(schemaNode.Children, nodeID)
-	}
-
-	schemaNode.ChildrenLoaded = true
-	return nil
 }
 
 // UpdateNodeDisplay updates the visual representation of a tree node

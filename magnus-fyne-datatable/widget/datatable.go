@@ -16,6 +16,7 @@ package widget
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -51,7 +52,11 @@ type DataTable struct {
 	container      *fyne.Container
 	selectedRow    int          // Currently selected row (-1 if none)
 	selectedRows   map[int]bool // Multiple selected rows (row index -> selected)
-	config         Config
+	selectedCell   struct {     // Currently selected cell (for cell selection mode)
+		row int // -1 if no cell selected
+		col int // -1 if no cell selected
+	}
+	config Config
 }
 
 // NewDataTable creates a new DataTable widget with default configuration.
@@ -68,6 +73,8 @@ func NewDataTableWithConfig(model *datatable.TableModel, config Config) *DataTab
 		selectedRow:  -1,                 // No row selected initially
 		selectedRows: make(map[int]bool), // Initialize multi-selection map
 	}
+	dt.selectedCell.row = -1 // No cell selected initially
+	dt.selectedCell.col = -1
 
 	dt.ExtendBaseWidget(dt)
 	dt.setupDefaultSorting() // Set up default sorting behavior
@@ -260,8 +267,26 @@ func (dt *DataTable) buildTable(config Config) {
 	if config.SelectionMode == SelectionModeRow {
 		// Row selection mode - notify with full row
 		dt.table.OnSelected = func(id widget.TableCellID) {
-			// Update selected row and refresh to show highlighting
-			dt.selectedRow = id.Row
+			// Toggle the row in multi-selection map
+			dt.selectedRows[id.Row] = !dt.selectedRows[id.Row]
+
+			// Update single selection to track the most recently clicked row
+			if dt.selectedRows[id.Row] {
+				dt.selectedRow = id.Row
+			} else {
+				// If deselected, set to -1 if no other rows selected
+				hasSelection := false
+				for _, selected := range dt.selectedRows {
+					if selected {
+						hasSelection = true
+						break
+					}
+				}
+				if !hasSelection {
+					dt.selectedRow = -1
+				}
+			}
+
 			dt.table.Refresh()
 			dt.Refresh() // Also refresh the DataTable widget itself
 
@@ -273,6 +298,10 @@ func (dt *DataTable) buildTable(config Config) {
 	} else {
 		// Cell selection mode - notify with specific cell
 		dt.table.OnSelected = func(id widget.TableCellID) {
+			// Store the selected cell coordinates
+			dt.selectedCell.row = id.Row
+			dt.selectedCell.col = id.Col
+
 			// Clear row selection in cell mode and refresh
 			dt.selectedRow = -1
 			dt.table.Refresh() // Ensure immediate visual update
@@ -402,7 +431,12 @@ func (dt *DataTable) SetWindow(window fyne.Window) {
 	// Register keyboard shortcuts for CMD+C (Mac) / Ctrl+C (Windows/Linux)
 	if window != nil {
 		copyHandler := func(shortcut fyne.Shortcut) {
-			_ = dt.CopySelectedRows()
+			// Use appropriate copy method based on selection mode
+			if dt.config.SelectionMode == SelectionModeRow {
+				_ = dt.CopySelectedRows()
+			} else {
+				_ = dt.CopySelectedCell()
+			}
 		}
 
 		// Register Ctrl+C for Windows/Linux
@@ -547,6 +581,8 @@ func (dt *DataTable) Reconfigure(newConfig Config) {
 	// Clear selection when reconfiguring
 	dt.selectedRow = -1
 	dt.selectedRows = make(map[int]bool) // Clear multi-selection
+	dt.selectedCell.row = -1              // Clear cell selection
+	dt.selectedCell.col = -1
 
 	// Save reference to old container that renderer is using
 	oldContainer := dt.container
@@ -619,7 +655,7 @@ func DefaultConfig() Config {
 		ShowColumnSelector:     false,
 		ShowSettingsButton:     true, // Show settings button by default
 		AutoAdjustColumnWidths: false,
-		SelectionMode:          SelectionModeCell, // Default to cell selection
+		SelectionMode:          SelectionModeRow, // Default to row selection
 		MinColumnWidth:         100,
 	}
 }
@@ -662,6 +698,9 @@ func (dt *DataTable) CopySelectedRows() error {
 		return fmt.Errorf("no rows selected")
 	}
 
+	// Sort the indices to maintain row order in the clipboard
+	sort.Ints(selectedRowIndices)
+
 	// Build the copied data
 	var rows []string
 
@@ -701,12 +740,43 @@ func (dt *DataTable) CopySelectedRows() error {
 	return nil
 }
 
+// CopySelectedCell copies the selected cell to the clipboard.
+// This method is used in cell selection mode to copy individual cells.
+func (dt *DataTable) CopySelectedCell() error {
+	if dt.config.SelectionMode != SelectionModeCell {
+		return fmt.Errorf("copy cell is only available in cell selection mode")
+	}
+
+	// Check if a cell is selected
+	if dt.selectedCell.row == -1 || dt.selectedCell.col == -1 {
+		return fmt.Errorf("no cell selected")
+	}
+
+	// Get the cell value
+	cell, err := dt.model.VisibleCell(dt.selectedCell.row, dt.selectedCell.col)
+	if err != nil {
+		return fmt.Errorf("error getting cell value: %w", err)
+	}
+
+	// Copy to clipboard - just the cell value, no header
+	if dt.window != nil {
+		dt.window.Clipboard().SetContent(cell.Formatted)
+	}
+
+	return nil
+}
+
 // TypedKey handles keyboard events for the DataTable.
-// This enables keyboard shortcuts like Cmd+C for copying selected rows.
+// This enables keyboard shortcuts like Cmd+C for copying selected rows or cells.
 func (dt *DataTable) TypedKey(event *fyne.KeyEvent) {
 	// For now, just handle C key (we'll add modifier detection later)
 	if event.Name == fyne.KeyC {
-		_ = dt.CopySelectedRows()
+		// Use appropriate copy method based on selection mode
+		if dt.config.SelectionMode == SelectionModeRow {
+			_ = dt.CopySelectedRows()
+		} else {
+			_ = dt.CopySelectedCell()
+		}
 	}
 }
 

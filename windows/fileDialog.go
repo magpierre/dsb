@@ -60,7 +60,15 @@ func NewProfileDialog(w fyne.Window, a fyne.App, callback func(string, error)) *
 		homeDir = "."
 	}
 	pd.homeDir = homeDir
-	pd.currentPath = homeDir
+
+	// Try to load last used directory from preferences
+	lastDir := a.Preferences().StringWithFallback("lastProfileBrowserDir", homeDir)
+	// Verify the directory exists
+	if stat, err := os.Stat(lastDir); err == nil && stat.IsDir() {
+		pd.currentPath = lastDir
+	} else {
+		pd.currentPath = homeDir
+	}
 
 	// Load recent profiles
 	pd.loadRecentProfiles()
@@ -120,13 +128,14 @@ func (pd *ProfileDialog) Show() {
 		func() fyne.CanvasObject {
 			icon := widget.NewIcon(theme.HistoryIcon())
 			label := widget.NewLabel("template")
-			label.Truncation = fyne.TextTruncateEllipsis
-			return container.NewHBox(icon, label)
+			label.Wrapping = fyne.TextWrapWord
+			return container.NewBorder(nil, nil, icon, nil, label)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
 			cont := obj.(*fyne.Container)
-			label := cont.Objects[1].(*widget.Label)
-			label.SetText(pd.recentProfiles[id])
+			label := cont.Objects[0].(*widget.Label)
+			// Show only the filename, not the full path
+			label.SetText(filepath.Base(pd.recentProfiles[id]))
 		},
 	)
 
@@ -151,6 +160,10 @@ func (pd *ProfileDialog) Show() {
 
 		// Update recent profiles (move to front)
 		pd.addRecentProfile(profilePath)
+
+		// Save the directory of the selected file for next time
+		dirPath := filepath.Dir(profilePath)
+		pd.app.Preferences().SetString("lastProfileBrowserDir", dirPath)
 
 		// Store file path for external access
 		pd.filePath = profilePath
@@ -217,6 +230,9 @@ func (pd *ProfileDialog) Show() {
 
 			// Add to recent profiles
 			pd.addRecentProfile(fullPath)
+
+			// Save the current directory for next time
+			pd.app.Preferences().SetString("lastProfileBrowserDir", pd.currentPath)
 
 			// Store file path for external access
 			pd.filePath = fullPath

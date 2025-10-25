@@ -15,7 +15,6 @@
 package windows
 
 import (
-	"context"
 	"fmt"
 	"io"
 
@@ -36,15 +35,6 @@ type TappableListItem struct {
 	onRightClick func(widget.ListItemID, *fyne.PointEvent)
 	onTap        func(widget.ListItemID)
 	itemID       widget.ListItemID
-}
-
-func newTappableListItem(onRightClick func(widget.ListItemID, *fyne.PointEvent)) *TappableListItem {
-	item := &TappableListItem{
-		onRightClick: onRightClick,
-		itemID:       -1,
-	}
-	item.ExtendBaseWidget(item)
-	return item
 }
 
 func (t *TappableListItem) SetItemID(id widget.ListItemID) {
@@ -143,6 +133,8 @@ type MainWindow struct {
 	treeWidget               *widget.Tree
 	// Go Editor toolbar buttons container
 	goEditorButtonsContainer *fyne.Container
+	// API timeout in seconds
+	apiTimeout int
 }
 
 func CreateMainWindow() *MainWindow {
@@ -156,6 +148,9 @@ func (t *MainWindow) OpenFile() {
 		if err != nil || uc == nil {
 			return
 		}
+
+		// Save the directory for next time
+		t.saveLastDirectory("lastProfileDir", uc.URI())
 
 		content, err := io.ReadAll(uc)
 		if err != nil {
@@ -185,6 +180,12 @@ func (t *MainWindow) OpenFile() {
 		t.w.Content().Refresh()
 		t.SetStatus("Profile loaded successfully")
 	}, t.w)
+
+	// Set the starting location to the last used directory
+	if lastDir := t.getLastDirectory("lastProfileDir"); lastDir != nil {
+		d.SetLocation(lastDir)
+	}
+
 	d.Show()
 }
 
@@ -258,6 +259,9 @@ func (t *MainWindow) NewMainWindow() {
 	// Initialize theme manager and set theme
 	t.themeManager = NewThemeManager(t.a)
 	t.a.Settings().SetTheme(t.themeManager.GetCurrentTheme())
+
+	// Load API timeout preference (default to 60 seconds)
+	t.apiTimeout = t.a.Preferences().IntWithFallback("apiTimeout", 60)
 
 	t.toolbar = widget.NewToolbar()
 	t.top = t.toolbar
@@ -559,16 +563,44 @@ func (t *MainWindow) showThemeSelector() {
 	infoLabel := widget.NewLabel("Choose a theme for the application.\nChanges will be applied immediately and saved.")
 	infoLabel.Wrapping = fyne.TextWrapWord
 
+	// Create timeout configuration
+	timeoutLabel := widget.NewLabel("API Timeout (seconds):")
+	timeoutEntry := widget.NewEntry()
+	timeoutEntry.SetText(fmt.Sprintf("%d", t.apiTimeout))
+	timeoutEntry.PlaceHolder = "60"
+	timeoutEntry.Validator = func(s string) error {
+		if s == "" {
+			return nil // Allow empty for placeholder
+		}
+		var timeout int
+		_, err := fmt.Sscanf(s, "%d", &timeout)
+		if err != nil {
+			return fmt.Errorf("must be a number")
+		}
+		if timeout < 10 || timeout > 600 {
+			return fmt.Errorf("must be between 10 and 600 seconds")
+		}
+		return nil
+	}
+
+	timeoutInfo := widget.NewLabel("Set timeout for Delta Sharing API calls (10-600 seconds)")
+	timeoutInfo.Wrapping = fyne.TextWrapWord
+	timeoutInfo.TextStyle = fyne.TextStyle{Italic: true}
+
 	// Create the dialog content
 	content := container.NewVBox(
 		infoLabel,
 		widget.NewSeparator(),
 		radio,
+		widget.NewSeparator(),
+		timeoutLabel,
+		timeoutEntry,
+		timeoutInfo,
 	)
 
 	// Create custom dialog
-	d := dialog.NewCustom("Select Theme", "Close", content, t.w)
-	d.Resize(fyne.NewSize(400, 300))
+	d := dialog.NewCustom("Settings", "Close", content, t.w)
+	d.Resize(fyne.NewSize(400, 400))
 
 	// Handle theme selection changes
 	radio.OnChanged = func(selected string) {
@@ -587,6 +619,20 @@ func (t *MainWindow) showThemeSelector() {
 		if newTheme != t.themeManager.GetCurrentType() {
 			t.themeManager.SetTheme(newTheme)
 			t.SetStatus(fmt.Sprintf("Theme changed to: %s", selected))
+		}
+	}
+
+	// Handle timeout changes
+	timeoutEntry.OnChanged = func(value string) {
+		if err := timeoutEntry.Validate(); err == nil && value != "" {
+			var timeout int
+			if _, err := fmt.Sscanf(value, "%d", &timeout); err == nil {
+				if timeout >= 10 && timeout <= 600 {
+					t.apiTimeout = timeout
+					t.a.Preferences().SetInt("apiTimeout", timeout)
+					t.SetStatus(fmt.Sprintf("API timeout changed to: %d seconds", timeout))
+				}
+			}
 		}
 	}
 
@@ -648,7 +694,7 @@ func (t *MainWindow) showGoEditor() {
 
 	// Create new Go editor if it doesn't exist
 	if t.goEditor == nil {
-		t.goEditor = NewGoEditor(t.w)
+		t.goEditor = NewGoEditor(t.w, t.a)
 	}
 
 	// Create and add the Go tab
@@ -777,7 +823,10 @@ func (t *MainWindow) loadTableData(table delta_sharing.Table, options *QueryOpti
 		return
 	}
 
-	re, err := ds.ListFilesInTable(context.Background(), table)
+	// Use configurable timeout for API call
+	ctx, cancel := createTimeoutContext(t.apiTimeout)
+	defer cancel()
+	re, err := ds.ListFilesInTable(ctx, table)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("failed to list files: %w", err), t.w)
 		return
@@ -803,12 +852,32 @@ func (t *MainWindow) loadTableData(table delta_sharing.Table, options *QueryOpti
 	}
 
 	// Load data - GetData handles its own threading
-	t.dataBrowser.GetData(t.profile, table, fileSelected, options)
+	t.dataBrowser.GetData(t.profile, table, fileSelected, options, t.apiTimeout)
 }
 
-// ScanTree is deprecated - tree navigation now uses lazy loading
-// This method is kept for compatibility but does nothing
-func (t *MainWindow) ScanTree() {
-	// No longer needed with tree-based navigation
-	// Data is loaded on-demand when tree nodes are expanded
+// saveLastDirectory saves the directory path to preferences
+func (t *MainWindow) saveLastDirectory(key string, uri fyne.URI) {
+	if uri != nil {
+		// Get the directory from the URI
+		listableURI, err := storage.ListerForURI(uri)
+		if err == nil {
+			// Save the parent directory
+			t.a.Preferences().SetString(key, listableURI.String())
+		}
+	}
+}
+
+// getLastDirectory retrieves the last used directory from preferences
+func (t *MainWindow) getLastDirectory(key string) fyne.ListableURI {
+	dirStr := t.a.Preferences().String(key)
+	if dirStr != "" {
+		uri, err := storage.ParseURI(dirStr)
+		if err == nil {
+			listableURI, err := storage.ListerForURI(uri)
+			if err == nil {
+				return listableURI
+			}
+		}
+	}
+	return nil
 }
